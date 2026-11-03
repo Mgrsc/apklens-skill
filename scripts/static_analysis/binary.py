@@ -5,11 +5,22 @@ import sys
 import xml.etree.ElementTree as ET
 import zlib
 
-from .common import AnalysisError, BudgetExceeded, Cancelled
+from .common import AnalysisError, BudgetExceeded, Cancelled, MemoryBudgetExceeded
 
 ANDROID_NAMESPACE = "http://schemas.android.com/apk/res/android"
 NO_INDEX = 0xFFFFFFFF
 SUPPORTED_DEX_VERSIONS = {b"035", b"037", b"038", b"039", b"040"}
+DEX_BUDGET_CHECK_UNITS = 1024
+BINARY_BUDGET_CHECK_ITEMS = 256
+BINARY_BUDGET_CHECK_BYTES = 1024 * 1024
+
+
+def checked_range(count, budget):
+    for index in range(count):
+        if index % BINARY_BUDGET_CHECK_ITEMS == 0:
+            budget.check()
+        yield index
+    budget.check()
 
 
 class BinaryReader:
@@ -43,7 +54,7 @@ class BinaryReader:
         raise AnalysisError("Unterminated ULEB128 value")
 
 
-def string_pool(reader, offset, limits):
+def string_pool(reader, offset, limits, budget):
     header_size = reader.u16(offset + 2)
     size = reader.u32(offset + 4)
     reader.require(offset, size)
@@ -77,7 +88,8 @@ def string_pool(reader, offset, limits):
             position += unit
         return value, position
 
-    for index in range(count):
+    decoded_bytes = 0
+    for index in checked_range(count, budget):
         position = offset + strings_start + reader.u32(offset + header_size + index * 4)
         if flags & 0x100:
             _, position = length_at(position, False)
@@ -101,6 +113,10 @@ def string_pool(reader, offset, limits):
                 "string_index": index,
             }
         )
+        decoded_bytes += byte_length
+        if decoded_bytes >= BINARY_BUDGET_CHECK_BYTES:
+            budget.check()
+            decoded_bytes = 0
     return output
 
 
@@ -122,7 +138,7 @@ def resource_strings(data, limits, budget):
                 raise AnalysisError("Invalid resource chunk size")
             reader.require(offset, size, end)
             if kind == 1:
-                result.extend(string_pool(reader, offset, limits))
+                result.extend(string_pool(reader, offset, limits, budget))
             elif kind in {2, 3, 0x0200}:
                 walk(offset + header_size, offset + size, depth + 1)
             if len(result) > limits.max_strings:
@@ -188,7 +204,7 @@ def xml_nodes(data, limits, budget):
             raise AnalysisError("Invalid XML chunk header")
         reader.require(offset, size)
         if kind == 1:
-            strings = string_pool(reader, offset, limits)
+            strings = string_pool(reader, offset, limits, budget)
         elif kind == 0x0102:
             reader.require(offset + header_size, 20, offset + size)
             extension = offset + header_size
@@ -347,9 +363,10 @@ def dex_index(data, limits, budget, inspect_code=True):
         or reader.u32(40) != 0x12345678
     ):
         raise AnalysisError("Invalid or unsupported DEX header")
+    view = memoryview(data)
     if (
-        reader.u32(8) != zlib.adler32(data[12:]) & 0xFFFFFFFF
-        or data[12:32] != hashlib.sha1(data[32:]).digest()
+        reader.u32(8) != zlib.adler32(view[12:]) & 0xFFFFFFFF
+        or data[12:32] != hashlib.sha1(view[32:]).digest()
     ):
         raise AnalysisError("DEX checksum or signature does not match its contents")
 
@@ -364,9 +381,8 @@ def dex_index(data, limits, budget, inspect_code=True):
 
     count, offset = table(56, 4)
     strings = []
-    for index in range(count):
-        if index % 1024 == 0:
-            budget.check()
+    decoded_bytes = 0
+    for index in checked_range(count, budget):
         position = reader.u32(offset + index * 4)
         declared_length, start = reader.uleb(position)
         end = data.find(
@@ -389,6 +405,10 @@ def dex_index(data, limits, budget, inspect_code=True):
                 "string_index": index,
             }
         )
+        decoded_bytes += end - start
+        if decoded_bytes >= BINARY_BUDGET_CHECK_BYTES:
+            budget.check()
+            decoded_bytes = 0
 
     def string_at(index):
         if index >= len(strings):
@@ -396,7 +416,10 @@ def dex_index(data, limits, budget, inspect_code=True):
         return strings[index]["value"]
 
     count, offset = table(64, 4)
-    types = [string_at(reader.u32(offset + index * 4)) for index in range(count)]
+    types = [
+        string_at(reader.u32(offset + index * 4))
+        for index in checked_range(count, budget)
+    ]
 
     def type_at(index):
         if index >= len(types):
@@ -405,7 +428,7 @@ def dex_index(data, limits, budget, inspect_code=True):
 
     count, offset = table(72, 12)
     prototypes = []
-    for index in range(count):
+    for index in checked_range(count, budget):
         position = offset + index * 12
         return_type = type_at(reader.u32(position + 4))
         parameters = reader.u32(position + 8)
@@ -414,12 +437,13 @@ def dex_index(data, limits, budget, inspect_code=True):
             length = reader.u32(parameters)
             reader.require(parameters + 4, length * 2)
             args = [
-                type_at(reader.u16(parameters + 4 + item * 2)) for item in range(length)
+                type_at(reader.u16(parameters + 4 + item * 2))
+                for item in checked_range(length, budget)
             ]
         prototypes.append("(" + "".join(args) + ")" + return_type)
     count, offset = table(88, 8)
     methods = []
-    for index in range(count):
+    for index in checked_range(count, budget):
         position = offset + index * 8
         proto = reader.u16(position + 2)
         if proto >= len(prototypes):
@@ -450,12 +474,12 @@ def dex_index(data, limits, budget, inspect_code=True):
                     counts.append(value)
                 if sum(counts) > limits.max_strings:
                     raise BudgetExceeded("DEX class data exceeds the budget")
-                for _ in range(counts[0] + counts[1]):
+                for _ in checked_range(counts[0] + counts[1], budget):
                     _, position = reader.uleb(position)
                     _, position = reader.uleb(position)
                 for method_count in counts[2:]:
                     method_index = 0
-                    for _ in range(method_count):
+                    for _ in checked_range(method_count, budget):
                         delta, position = reader.uleb(position)
                         method_index += delta
                         _, position = reader.uleb(position)
@@ -477,9 +501,11 @@ def dex_index(data, limits, budget, inspect_code=True):
                                 "<" + "H" * unit_count, data, code_offset + 16
                             )
                         cursor = 0
+                        next_budget_check = 0
                         while cursor < unit_count:
-                            if cursor % 1024 == 0:
+                            if cursor >= next_budget_check:
                                 budget.check()
+                                next_budget_check = cursor + DEX_BUDGET_CHECK_UNITS
                             width = instruction_width(units, cursor)
                             if cursor + width > unit_count:
                                 raise AnalysisError("Truncated DEX instruction")
@@ -520,7 +546,7 @@ def dex_index(data, limits, budget, inspect_code=True):
                                 )
                             cursor += width
                         scanned_methods += 1
-            except Cancelled:
+            except (Cancelled, MemoryBudgetExceeded):
                 raise
             except AnalysisError as error:
                 gaps.append(str(error))

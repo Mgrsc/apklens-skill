@@ -159,7 +159,17 @@ def parse_appops(value):
 
 
 class DeviceCollector:
-    def __init__(self, executable, serial, user, output, limits, cancel, timeout=60):
+    def __init__(
+        self,
+        executable,
+        serial,
+        user,
+        output,
+        limits,
+        cancel,
+        timeout=60,
+        checkpoint=None,
+    ):
         if (
             not serial
             or serial.startswith("-")
@@ -178,6 +188,28 @@ class DeviceCollector:
         self.stages = []
         self.packages = {}
         self.artifacts = []
+        self.checkpoint = checkpoint
+        self.settings = {}
+        self.installed_count = 0
+        self.targets = []
+        self.excluded_packages = []
+
+    def snapshot(self):
+        return {
+            "serial": self.serial,
+            "user": self.user,
+            "installed_count": self.installed_count,
+            "selected_packages": self.targets,
+            "excluded_packages": self.excluded_packages,
+            "packages": self.packages,
+            "stages": self.stages,
+            "artifacts": self.artifacts,
+            "settings": self.settings,
+        }
+
+    def persist(self, complete=False):
+        if self.checkpoint:
+            self.checkpoint(self.snapshot(), complete)
 
     def shell(self, arguments):
         result = run_command(
@@ -204,6 +236,9 @@ class DeviceCollector:
             ["pm", "list", "packages", "--user", str(self.user), "-f", "-U", "-i"]
         )
         packages, rejected = parse_inventory(inventory["stdout"])
+        self.installed_count = len(packages)
+        self.targets = sorted(set(selected) if selected else packages)
+        self.excluded_packages = sorted(set(packages) - set(self.targets))
         if rejected:
             inventory["status"], inventory["reason"] = (
                 "PARTIAL",
@@ -239,7 +274,7 @@ class DeviceCollector:
             self.output / "package-snapshot.json",
             {"user": self.user, "inventory": inventory, "dumpsys": dump},
         )
-        settings = {}
+        settings = self.settings
         for name in (
             "enabled_accessibility_services",
             "enabled_notification_listeners",
@@ -256,6 +291,7 @@ class DeviceCollector:
             )
         atomic_json(self.output / "settings-snapshot.json", settings)
         targets = sorted(set(selected) if selected else packages)
+        self.persist()
         for package in targets:
             if self.cancel.is_set():
                 self.stages.append(
@@ -275,6 +311,7 @@ class DeviceCollector:
             )
             item["stages"] = []
             item["user"] = self.user
+            self.packages[package] = item
             if package not in packages:
                 item["stages"].append(
                     stage(
@@ -285,6 +322,7 @@ class DeviceCollector:
                     )
                 )
                 self.packages[package] = item
+                self.persist()
                 continue
             meta = metadata.get(package)
             if meta:
@@ -324,6 +362,7 @@ class DeviceCollector:
             item["stages"].append(
                 stage("appops_snapshot", appops["status"], package, appops["reason"])
             )
+            self.persist()
             paths = self.shell(["pm", "path", "--user", str(self.user), package])
             remote_paths = [
                 line[8:].strip()
@@ -403,6 +442,7 @@ class DeviceCollector:
                             result["reason"] or "ADB did not create an APK",
                         )
                     )
+                self.persist()
                 target.unlink(missing_ok=True)
             after = self.shell(["pm", "path", "--user", str(self.user), package])
             final_paths = sorted(
@@ -436,14 +476,6 @@ class DeviceCollector:
                 )
             )
             self.packages[package] = item
-        return {
-            "serial": self.serial,
-            "user": self.user,
-            "installed_count": len(packages),
-            "selected_packages": targets,
-            "excluded_packages": sorted(set(packages) - set(targets)),
-            "packages": self.packages,
-            "stages": self.stages,
-            "artifacts": self.artifacts,
-            "settings": settings,
-        }
+            self.persist()
+        self.persist(complete=not self.cancel.is_set())
+        return self.snapshot()

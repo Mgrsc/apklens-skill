@@ -14,7 +14,10 @@ def uleb(value):
 
 
 def make_dex(
-    extra_strings=(), url="https://events.example.org/collect?token=private-value"
+    extra_strings=(),
+    url="https://events.example.org/collect?token=private-value",
+    *,
+    instructions=None,
 ):
     strings = [
         url,
@@ -49,7 +52,8 @@ def make_dex(
     while len(data) % 4:
         data.append(0)
     code_offset = len(data)
-    instructions = [0x001A, 0, 0x006E, 1, 0, 0x000E]
+    if instructions is None:
+        instructions = [0x001A, 0, 0x006E, 1, 0, 0x000E]
     data.extend(struct.pack("<HHHHII", 1, 0, 1, 0, 0, len(instructions)))
     data.extend(struct.pack("<" + "H" * len(instructions), *instructions))
     class_data_offset = len(data)

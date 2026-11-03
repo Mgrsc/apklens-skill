@@ -14,6 +14,12 @@ Thumbs.db
 *.aab
 *.dex
 analysis.json
+analysis.sqlite3
+analysis.sqlite3-journal
+analysis.sqlite3-wal
+analysis.sqlite3-shm
+snapshot.json
+progress.json
 summary.json
 report.md
 domains.txt

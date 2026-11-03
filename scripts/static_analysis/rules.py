@@ -113,12 +113,39 @@ def signal_matches(value, source, level="E1"):
     return findings
 
 
-def sdk_matches(types, endpoints, artifact, entry):
+SDK_ENDPOINT_EVIDENCE_LIMIT = 3
+RULE_BUDGET_INTERVAL = 256
+
+
+def sdk_domain_matches(endpoints, budget=None):
+    matches = {}
+    for name, _, _, domains in SDK_RULES:
+        if budget is not None:
+            budget.check()
+        selected = []
+        for index, endpoint in enumerate(endpoints):
+            if budget is not None and index % RULE_BUDGET_INTERVAL == 0:
+                budget.check()
+            if endpoint.get("host") and any(
+                host_matches(endpoint["host"], domain) for domain in domains
+            ):
+                selected.append(endpoint)
+                if len(selected) == SDK_ENDPOINT_EVIDENCE_LIMIT:
+                    break
+        matches[name] = selected
+    return matches
+
+
+def sdk_matches(types, endpoints, artifact, entry, domain_matches=None, budget=None):
+    if domain_matches is None:
+        domain_matches = sdk_domain_matches(endpoints, budget)
     results = []
-    for name, purpose, prefixes, domains in SDK_RULES:
+    for name, purpose, prefixes, _ in SDK_RULES:
         evidence = []
         namespaces = tuple("L" + prefix for prefix in prefixes)
         for index, descriptor in enumerate(types):
+            if budget is not None and index % RULE_BUDGET_INTERVAL == 0:
+                budget.check()
             if descriptor.startswith(namespaces):
                 item = {
                     "artifact": artifact,
@@ -130,13 +157,8 @@ def sdk_matches(types, endpoints, artifact, entry):
                 item["id"] = stable_id("sdk_type", name, artifact, entry, index)
                 evidence.append(item)
                 break
-        matching_endpoints = [
-            item
-            for item in endpoints
-            if item.get("host")
-            and any(host_matches(item["host"], domain) for domain in domains)
-        ]
-        for endpoint in matching_endpoints[:3]:
+        matching_endpoints = domain_matches[name]
+        for endpoint in matching_endpoints:
             evidence.extend(endpoint["evidence"][:1])
         if evidence:
             results.append(

@@ -1,12 +1,30 @@
+import heapq
 import html
 import json
 import re
 from collections import Counter
+from functools import partial
+from itertools import islice
 from pathlib import Path
 
 from . import SCHEMA_VERSION
-from .common import AnalysisError, atomic_json, atomic_text, read_json
+from .common import (
+    AnalysisError,
+    atomic_json,
+    atomic_text,
+    atomic_writer,
+    check_resources,
+    read_json,
+)
 from .endpoints import sanitized
+from .storage import (
+    COMPLETE_COVERAGE_STATUSES,
+    STORE_VERSION,
+    AnalysisStore,
+    Apps,
+    Records,
+    application_view,
+)
 
 SECTIONS = (
     "apps",
@@ -22,9 +40,18 @@ SECTIONS = (
 
 
 def load_report(path):
+    path = Path(path)
+    if path.suffix == ".sqlite3":
+        store = AnalysisStore(path, readonly=True)
+        try:
+            return store.report()
+        except Exception:
+            store.close()
+            raise
     value = read_json(path)
     if (
-        value.get("schema_version") != SCHEMA_VERSION
+        not isinstance(value, dict)
+        or value.get("schema_version") != SCHEMA_VERSION
         or not isinstance(value.get("apps"), list)
         or not isinstance(value.get("run"), dict)
     ):
@@ -32,30 +59,39 @@ def load_report(path):
     return value
 
 
-def app_summary(app):
-    return {
-        "id": app["id"],
-        "package": app["package"],
-        "version_code": app["version_code"],
-        "user": app["user"],
-        "status": app["status"],
-        "artifact_count": len(app["artifacts"]),
-        "permission_count": len(app["permissions"]),
-        "endpoint_count": len(app["endpoints"]),
-        "sdk_candidates": sorted({item["name"] for item in app["sdks"]}),
-        "signal_types": sorted({item["type"] for item in app["signals"]}),
-        "finding_count": len(app["findings"]),
-        "priority": app["priority"],
-    }
+def close_report(report):
+    if isinstance(report.get("apps"), Apps):
+        report["apps"].store.close()
 
 
-def summary(report):
-    statuses = Counter(item["status"] for item in report.get("stages", []))
-    statuses.update(
-        item["status"] for app in report["apps"] for item in app["coverage"]
+def _application_view(app):
+    records = app.get("signals")
+    return (
+        records.store.app_view(app)
+        if isinstance(records, Records)
+        else application_view(app)
     )
-    ranked = sorted(
-        report["apps"], key=lambda app: (-app["priority"]["score"], app["id"])
+
+
+def app_summary(app):
+    return _application_view(app)["summary"]
+
+
+def summary(report, cancel=None, budget=None):
+    check_resources(cancel, budget)
+    statuses = Counter(item["status"] for item in report.get("stages", []))
+
+    def applications():
+        for app in report["apps"]:
+            check_resources(cancel, budget)
+            view = _application_view(app)
+            statuses.update(view["coverage_counts"])
+            yield view["summary"]
+
+    ranked = heapq.nsmallest(
+        20,
+        applications(),
+        key=lambda app: (-app["priority"]["score"], app["id"]),
     )
     return sanitized(
         {
@@ -65,14 +101,14 @@ def summary(report):
             "totals": report["totals"],
             "coverage_counts": dict(sorted(statuses.items())),
             "limitations": report["limitations"],
-            "apps": [app_summary(app) for app in ranked[:20]],
-            "apps_view_truncated": len(ranked) > 20,
-            "apps_total": len(ranked),
+            "apps": ranked,
+            "apps_view_truncated": len(report["apps"]) > 20,
+            "apps_total": len(report["apps"]),
         }
     )
 
 
-def section_rows(report, section, package=None):
+def section_rows(report, section, package=None, identity=None):
     if section == "coverage" and package is None:
         for item in report.get("stages", []):
             yield {"scope": "run", **item}
@@ -83,6 +119,16 @@ def section_rows(report, section, package=None):
         if section == "apps":
             yield app_summary(app)
         elif section == "evidence":
+            if isinstance(report["apps"], Apps):
+                store = report["apps"].store
+                evidence_rows = (
+                    store.evidence_page(app["id"], identity=identity)
+                    if store.version >= STORE_VERSION
+                    else store.evidence(app["id"])
+                )
+                for evidence in evidence_rows:
+                    yield {**owner, **evidence}
+                continue
             seen = set()
             for category in ("endpoints", "sdks", "signals"):
                 for item in app[category]:
@@ -91,8 +137,57 @@ def section_rows(report, section, package=None):
                             seen.add(evidence["id"])
                             yield {**owner, **evidence}
         else:
-            for item in app[section]:
+            values = app[section]
+            if (
+                identity
+                and isinstance(values, Records)
+                and section != "coverage"
+                and (section != "findings" or values.store.version >= STORE_VERSION)
+            ):
+                values = values.page(identity=identity)
+            for item in values:
                 yield {**owner, **item}
+
+
+def _indexed_query(report, section, package, offset, limit, identity):
+    selected = []
+    total = 0
+
+    def take(rows):
+        nonlocal total
+        for row in rows:
+            if identity and row.get("id") != identity:
+                continue
+            if offset <= total < offset + limit:
+                selected.append(row)
+            total += 1
+
+    if section == "coverage" and package is None:
+        take({"scope": "run", **item} for item in report.get("stages", []))
+    for app in report["apps"]:
+        if package and app["package"] != package:
+            continue
+        if section == "apps":
+            take((app_summary(app),))
+            continue
+        owner = {"app_id": app["id"], "package": app["package"], "user": app["user"]}
+        if section == "evidence":
+            store = report["apps"].store
+            count = store.evidence_count(app["id"], identity)
+            page = partial(store.evidence_page, app["id"], identity=identity)
+        elif isinstance(app[section], Records):
+            records = app[section]
+            count = records.count_records(identity)
+            page = partial(records.page, identity=identity)
+        else:
+            take({**owner, **item} for item in app[section])
+            continue
+        start = max(0, offset - total)
+        remaining = max(0, limit - len(selected))
+        if remaining and start < count:
+            selected.extend({**owner, **item} for item in page(start, remaining))
+        total += count
+    return total, selected
 
 
 def query(
@@ -105,20 +200,34 @@ def query(
     contains=None,
     include_sensitive=False,
 ):
-    total = 0
-    selected = []
-    for row in section_rows(report, section, package):
-        if identity and row.get("id") != identity:
-            continue
-        if (
-            contains
-            and contains.casefold()
-            not in json.dumps(row, ensure_ascii=False).casefold()
-        ):
-            continue
-        if offset <= total < offset + limit:
-            selected.append(row)
-        total += 1
+    identity = identity or None
+    store = report["apps"].store if isinstance(report["apps"], Apps) else None
+    indexed = (
+        store
+        and not contains
+        and not (identity and section == "coverage")
+        and not (store.version < STORE_VERSION and section == "evidence")
+        and not (store.version < STORE_VERSION and identity and section == "findings")
+    )
+    if indexed:
+        total, selected = _indexed_query(
+            report, section, package, offset, limit, identity
+        )
+    else:
+        total = 0
+        selected = []
+        for row in section_rows(report, section, package, identity):
+            if identity and row.get("id") != identity:
+                continue
+            if (
+                contains
+                and contains.casefold()
+                not in json.dumps(row, ensure_ascii=False).casefold()
+            ):
+                continue
+            if offset <= total < offset + limit:
+                selected.append(row)
+            total += 1
     result = {
         "schema_version": SCHEMA_VERSION,
         "section": section,
@@ -130,7 +239,8 @@ def query(
     return result if include_sensitive else sanitized(result)
 
 
-def markdown(report, limit=100):
+def markdown(report, limit=100, cancel=None, budget=None):
+    check_resources(cancel, budget)
     template = Path(__file__).resolve().parents[2] / "references" / "report-template.md"
 
     def cell(value):
@@ -159,13 +269,17 @@ def markdown(report, limit=100):
     gap_count = 0
 
     def append(name, values):
+        check_resources(cancel, budget)
         if len(tables[name]) < limit:
             tables[name].append(
                 "| " + " | ".join(cell(sanitized(value)) for value in values) + " |"
             )
 
     for app in report["apps"]:
+        check_resources(cancel, budget)
         package = app["package"] or app["id"]
+        view = _application_view(app)
+        gap_count += view["gap_count"]
         append(
             "apps",
             (
@@ -174,10 +288,12 @@ def markdown(report, limit=100):
                 len(app["artifacts"]),
                 len(app["permissions"]),
                 len(app["endpoints"]),
-                ", ".join(sorted({item["name"] for item in app["sdks"]})),
+                ", ".join(view["summary"]["sdk_candidates"]),
             ),
         )
-        for permission in app["permissions"]:
+        for permission in islice(
+            app["permissions"], max(0, limit - len(tables["permissions"]))
+        ):
             append(
                 "permissions",
                 (
@@ -189,7 +305,9 @@ def markdown(report, limit=100):
                     permission["max_sdk"],
                 ),
             )
-        for capability in app["capabilities"]:
+        for capability in islice(
+            app["capabilities"], max(0, limit - len(tables["capabilities"]))
+        ):
             append(
                 "capabilities",
                 (
@@ -199,7 +317,7 @@ def markdown(report, limit=100):
                     capability["meaning"],
                 ),
             )
-        for finding in app["findings"]:
+        for finding in islice(app["findings"], max(0, limit - len(tables["findings"]))):
             append(
                 "findings",
                 (
@@ -210,7 +328,7 @@ def markdown(report, limit=100):
                     ", ".join(finding["evidence_ids"][:3]),
                 ),
             )
-        for sdk in app["sdks"]:
+        for sdk in islice(app["sdks"], max(0, limit - len(tables["sdks"]))):
             append(
                 "sdks",
                 (
@@ -221,23 +339,21 @@ def markdown(report, limit=100):
                     ", ".join(evidence["id"] for evidence in sdk["evidence"][:3]),
                 ),
             )
-        for name, count in sorted(
-            Counter(signal["type"] for signal in app["signals"]).items()
+        for name, stats in islice(
+            sorted(view["signals"].items()), max(0, limit - len(tables["signals"]))
         ):
             append(
                 "signals",
                 (
                     package,
                     name,
-                    count,
-                    max(
-                        signal["evidence_level"]
-                        for signal in app["signals"]
-                        if signal["type"] == name
-                    ),
+                    stats["count"],
+                    stats["evidence_level"],
                 ),
             )
-        for endpoint in app["endpoints"]:
+        for endpoint in islice(
+            app["endpoints"], max(0, limit - len(tables["endpoints"]))
+        ):
             append(
                 "endpoints",
                 (
@@ -248,21 +364,28 @@ def markdown(report, limit=100):
                     endpoint["id"],
                 ),
             )
-        for item in app["coverage"]:
-            if item["status"] not in {"COMPLETE", "NOT_APPLICABLE", "EXCLUDED"}:
-                gap_count += 1
-                append(
-                    "gaps",
-                    (
-                        package,
-                        item["stage"],
-                        item["status"],
-                        item.get("source", ""),
-                        item.get("reason", ""),
-                    ),
-                )
+        gaps = (
+            item
+            for item in app["coverage"]
+            if item["status"] not in COMPLETE_COVERAGE_STATUSES
+        )
+        for item in islice(gaps, max(0, limit - len(tables["gaps"]))):
+            append(
+                "gaps",
+                (
+                    package,
+                    item["stage"],
+                    item["status"],
+                    item.get("source", ""),
+                    item.get("reason", ""),
+                ),
+            )
         for manifest in app["manifests"]:
+            if len(tables["components"]) >= limit:
+                break
             for component in manifest["components"]:
+                if len(tables["components"]) >= limit:
+                    break
                 if component["exported"] is True or component["exported"] is None:
                     append(
                         "components",
@@ -276,7 +399,8 @@ def markdown(report, limit=100):
                         ),
                     )
     for item in report.get("stages", []):
-        if item["status"] not in {"COMPLETE", "NOT_APPLICABLE", "EXCLUDED"}:
+        check_resources(cancel, budget)
+        if item["status"] not in COMPLETE_COVERAGE_STATUSES:
             gap_count += 1
             append(
                 "gaps",
@@ -306,34 +430,65 @@ def markdown(report, limit=100):
     )
 
 
-def export_reports(report, output, view_limit=100, write_analysis=True):
+def export_reports(
+    report, output, view_limit=100, write_analysis=True, cancel=None, budget=None
+):
+    check_resources(cancel, budget)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if write_analysis:
-        atomic_json(output / "analysis.json", report)
-    atomic_json(output / "summary.json", summary(report))
-    atomic_text(output / "report.md", markdown(report, view_limit))
-    hosts = {
-        item["host"]
-        for app in report["apps"]
-        for item in app["endpoints"]
-        if item.get("host")
-    }
-    telemetry = {
-        item["host"]
-        for app in report["apps"]
-        for item in app["endpoints"]
-        if item.get("host")
-        and set(item["tags"])
-        & {"telemetry_path_candidate", "sdk_telemetry_domain_candidate"}
-    }
-    atomic_text(
-        output / "domains.txt", "\n".join(sorted(hosts)) + ("\n" if hosts else "")
+        atomic_json(output / "analysis.json", report, cancel, budget)
+    atomic_json(
+        output / "summary.json", summary(report, cancel, budget), cancel, budget
     )
     atomic_text(
-        output / "telemetry-domains.txt",
-        "\n".join(sorted(telemetry)) + ("\n" if telemetry else ""),
+        output / "report.md",
+        markdown(report, view_limit, cancel, budget),
+        cancel,
+        budget,
     )
+
+    def write_domains(filename, hosts):
+        with atomic_writer(output / filename, cancel=cancel, budget=budget) as handle:
+            for host in hosts:
+                check_resources(cancel, budget)
+                handle.write(host + "\n")
+
+    if isinstance(report["apps"], Apps):
+        for filename, condition in (
+            ("domains.txt", ""),
+            ("telemetry-domains.txt", "WHERE telemetry=1"),
+        ):
+            check_resources(cancel, budget)
+            cursor = report["apps"].store.connection.execute(
+                f"SELECT host FROM domains {condition} ORDER BY host"
+            )
+            try:
+                write_domains(filename, (row[0] for row in cursor))
+            finally:
+                cursor.close()
+        check_resources(cancel, budget)
+        return report_files(output, write_analysis)
+    hosts = set()
+    telemetry = set()
+    for app in report["apps"]:
+        check_resources(cancel, budget)
+        for item in app["endpoints"]:
+            check_resources(cancel, budget)
+            if item.get("host"):
+                hosts.add(item["host"])
+                if set(item["tags"]) & {
+                    "telemetry_path_candidate",
+                    "sdk_telemetry_domain_candidate",
+                }:
+                    telemetry.add(item["host"])
+    write_domains("domains.txt", sorted(hosts))
+    write_domains("telemetry-domains.txt", sorted(telemetry))
+    check_resources(cancel, budget)
+    return report_files(output, write_analysis)
+
+
+def report_files(output, write_analysis):
     return {
         name: str(output / name)
         for name in (

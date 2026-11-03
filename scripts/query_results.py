@@ -1,9 +1,10 @@
 import argparse
 import json
+import sqlite3
 import sys
 
 from static_analysis.common import AnalysisError, diagnostic
-from static_analysis.reports import SECTIONS, load_report, query, summary
+from static_analysis.reports import SECTIONS, close_report, load_report, query, summary
 
 
 def main():
@@ -31,6 +32,7 @@ def main():
         parser.error(
             "Use a specific section for filtering, pagination, or sensitive values"
         )
+    report = None
     try:
         report = load_report(args.report)
         result = (
@@ -49,9 +51,19 @@ def main():
         )
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
-    except (AnalysisError, OSError, ValueError, KeyError, TypeError) as error:
+    except (
+        AnalysisError,
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        sqlite3.Error,
+    ) as error:
         diagnostic("query.failed", level="ERROR", status="FAILED", error=str(error))
         return 1
+    finally:
+        if report is not None:
+            close_report(report)
 
 
 if __name__ == "__main__":

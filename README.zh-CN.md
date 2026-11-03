@@ -10,6 +10,7 @@
 - **上下文友好与安全脱敏**：结构化生成轻量摘要与分段查询机制，避免大文件撑爆大模型 Context Window，自动对网络凭据与敏感参数打码。
 - **全方位静态解构**：支持单个或多个 Split APK，高保真提取 DEX 引用、资源字符串池、Manifest 权限、导出组件与候选端点。
 - **设备快照采集**：支持通过 ADB 连接已授权实体设备，一键完成已安装应用的元数据与 APK 静态采集。
+- **批量持久化与恢复**：使用标准库 SQLite 逐制品保存检查点，从磁盘合并和导出，支持在新目录恢复中断任务。采集快照可离线复用，无需再次复制 APK。
 - **严守事实边界**：明确划分 E0–E2 静态证据等级，严禁大模型在隐私与遥测分析中臆测虚构数据流。
 
 ## 快速上手
@@ -32,7 +33,7 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 
 - **开发者直接运行（可选）**：无需 AI，亦可在终端直接执行分析脚本：
   ```sh
-  python3 scripts/analyze.py --apk path/to/app.apk -o output_dir
+  python3 scripts/analyze.py scan --apk path/to/app.apk --output output_dir
   ```
 - **真机分析说明**：若分析实体手机，请确保已开启 USB/无线调试且 `adb devices -l` 状态为 `device`。AI 会根据环境交互式引导完成配对与拉取。
 
@@ -43,7 +44,11 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 - `report.md`：结构清晰的 Markdown 综合审计分析报告。
 - `summary.json`：针对 AI 上下文优化的轻量高优先摘要。
 - `analysis.json`：包含所有 E0–E2 静态证据与调用关系的机器可读全量事实。
+- `analysis.sqlite3`：持久检查点与最终事实，大任务查询和重新导出的首选输入。
+- `snapshot.json` / `progress.json`：可复用的采集状态与最新执行阶段。
 - `domains.txt` / `telemetry-domains.txt`：归一化的网络端点与第三方遥测域名候选。
+
+大任务优先查询 `analysis.sqlite3`，避免整体读取 JSON 导出。新数据库为 ID、分页和证据引用建立索引，轻量视图避免摘要与限行报告反复全量扫描。当前脚本读取数据库版本 1 和 2，新任务写入版本 2，JSON 继续保持 schema 1。可用 `python3 scripts/analyze.py scan --resume previous_task_dir --output new_task_dir` 恢复任务；请保留原任务目录及其引用的 APK。恢复时在新目录重建派生索引。仅采集、离线快照、内存预算及无清单旧任务的恢复方式详见使用参考。
 
 ## 详细文档指引
 

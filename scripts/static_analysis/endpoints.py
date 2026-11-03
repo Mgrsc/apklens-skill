@@ -40,6 +40,7 @@ SOURCE_SUFFIXES = {
     "properties",
     "proto",
 }
+MATCH_BUDGET_INTERVAL = 256
 NETWORK_SCHEMES = {"http", "https", "ws", "wss", "mqtt", "mqtts", "tcp", "tls", "udp"}
 
 
@@ -178,8 +179,9 @@ def decoded_variants(value, max_length=16384):
 
 
 class EndpointCollector:
-    def __init__(self, limits):
+    def __init__(self, limits, budget=None):
         self.limits = limits
+        self.budget = budget
         self.items = {}
         self.truncated = False
         self.evidence_truncated = False
@@ -196,15 +198,29 @@ class EndpointCollector:
                 ("scheme_relative", RELATIVE_PATTERN),
                 ("domain", DOMAIN_PATTERN),
             ):
-                for match in pattern.finditer(decoded):
-                    if kind == "domain" and any(
-                        start <= match.start() < end for start, end in occupied
-                    ):
-                        continue
+                if kind == "domain":
+                    occupied.sort()
+                    occupied_index = 0
+                    occupied_end = 0
+                for index, match in enumerate(pattern.finditer(decoded)):
+                    if self.budget is not None and index % MATCH_BUDGET_INTERVAL == 0:
+                        self.budget.check()
+                    if kind == "domain":
+                        while (
+                            occupied_index < len(occupied)
+                            and occupied[occupied_index][0] <= match.start()
+                        ):
+                            occupied_end = max(
+                                occupied_end, occupied[occupied_index][1]
+                            )
+                            occupied_index += 1
+                        if match.start() < occupied_end:
+                            continue
                     endpoint = normalize_endpoint(match.group(), kind)
                     if endpoint is None:
                         continue
-                    occupied.append(match.span())
+                    if kind != "domain":
+                        occupied.append(match.span())
                     key = (endpoint["kind"], endpoint["value"])
                     if key not in self.items:
                         if len(self.items) >= self.limits.max_results:

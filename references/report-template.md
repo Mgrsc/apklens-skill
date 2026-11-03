@@ -5,7 +5,7 @@
 - Mode: `{{mode}}`
 - Applications: {{app_count}}; Endpoint and Domain Candidates: {{endpoint_count}}; Coverage Gaps: {{gap_count}}.
 
-This report is derived from static artifacts and optional one-time device snapshots. It does not prove that applications actually collected or transmitted data. URL query parameters and credentials are redacted in this view; local `analysis.json` and device snapshots may contain sensitive details. Markdown tables show up to {{view_limit}} items per category; query `analysis.json` in pages for full data.
+This report is derived from static artifacts and optional one-time device snapshots. It does not prove that applications actually collected or transmitted data. URL query parameters and credentials are redacted in this view; local JSON, SQLite, and device snapshots may contain sensitive details. Markdown tables show up to {{view_limit}} items per category; query the task's `analysis.sqlite3` in pages for large results, or use a supported legacy `analysis.json` input.
 
 ## Application Overview
 

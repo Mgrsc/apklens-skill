@@ -7,25 +7,46 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from functools import lru_cache
 from pathlib import Path
 
 from . import ENGINE_VERSION, SCHEMA_VERSION
-from .binary import dex_index, printable_strings, resource_strings, xml_nodes
+from .binary import (
+    checked_range,
+    dex_index,
+    printable_strings,
+    resource_strings,
+    xml_nodes,
+)
 from .common import (
     AnalysisError,
     Budget,
     BudgetExceeded,
     Cancelled,
+    JsonRecords,
+    MemoryBudgetExceeded,
     aggregate_status,
     atomic_json,
+    available_memory,
+    check_resources,
+    json_checksum,
     read_json,
+    resident_bytes,
     run_command,
     stable_id,
     stage,
 )
 from .endpoints import EndpointCollector, host_matches
 from .manifest import analyze_manifest
-from .rules import RULE_VERSION, SDK_RULES, capabilities, sdk_matches, signal_matches
+from .rules import (
+    RULE_VERSION,
+    SDK_RULES,
+    capabilities,
+    sdk_domain_matches,
+    sdk_matches,
+    signal_matches,
+)
+from .storage import Apps, ArtifactResults, FindingIds, artifact_status
 
 DEX_NAME = re.compile(r"(?:.*/)?classes(?:[0-9]+)?\.dex\Z")
 TEXT_SUFFIXES = {
@@ -44,6 +65,8 @@ TEXT_SUFFIXES = {
     ".url",
 }
 NON_CANDIDATE_PREFIXES = ("META-INF/",)
+SDK_HOST_CACHE_SIZE = 4096
+CACHE_MEMORY_MULTIPLIER = 8
 
 
 def cache_key(identity, limits, mode):
@@ -58,42 +81,65 @@ def cache_key(identity, limits, mode):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def cache_read(path):
-    value = read_json(path)
+def cache_read(path, budget=None):
+    check_resources(budget=budget)
+    if budget is not None:
+        headroom = available_memory()
+        if budget.limits.memory_bytes:
+            resident = resident_bytes()
+            if resident is not None:
+                remaining = max(0, budget.limits.memory_bytes - resident)
+                headroom = remaining if headroom is None else min(headroom, remaining)
+        if (
+            headroom is not None
+            and Path(path).stat().st_size * CACHE_MEMORY_MULTIPLIER > headroom
+        ):
+            return None
+    value = read_json(path, budget=budget)
     payload = value["result"]
-    checksum = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=True).encode()
-    ).hexdigest()
+    checksum = json_checksum(payload, budget=budget)
     if value.get("checksum") != checksum or not isinstance(payload.get("stages"), list):
         raise AnalysisError("Cached result failed validation")
     return payload
 
 
-def cache_write(path, result):
-    checksum = hashlib.sha256(
-        json.dumps(result, sort_keys=True, ensure_ascii=True).encode()
-    ).hexdigest()
-    atomic_json(path, {"checksum": checksum, "result": result})
+def cache_write(path, result, cancel=None, budget=None):
+    check_resources(cancel, budget)
+    checksum = json_checksum(result, cancel=cancel, budget=budget)
+    value = {
+        key: JsonRecords(item)
+        if key in {"endpoints", "signals", "sdks", "stages"}
+        else item
+        for key, item in result.items()
+    }
+    atomic_json(path, {"checksum": checksum, "result": value}, cancel, budget)
 
 
 def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     started = time.monotonic()
+    budget = Budget(limits, cancel)
     identity = artifact["sha256"]
     key = cache_key(identity, limits, mode)
     cache_file = Path(cache_directory) / f"{key}.json" if cache_directory else None
     cache_issue = None
     if cache_file and cache_file.exists():
         try:
-            result = cache_read(cache_file)
-            if result.get("sha256") != identity or result.get("cache_key") != key:
-                raise AnalysisError("Cached identity does not match the artifact")
-            result["cache"] = {"hit": True, "key": key}
-            result["elapsed_seconds"] = round(time.monotonic() - started, 3)
-            return result
+            result = cache_read(cache_file, budget)
+            if result is None:
+                cache_issue = "Cache read was skipped to preserve memory headroom"
+                cache_file = None
+            else:
+                if result.get("sha256") != identity or result.get("cache_key") != key:
+                    raise AnalysisError("Cached identity does not match the artifact")
+                result["cache"] = {"hit": True, "key": key}
+                result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                budget.check()
+                return result
+        except (Cancelled, BudgetExceeded):
+            raise
         except (OSError, ValueError, KeyError, TypeError, AnalysisError):
             cache_issue = "Invalid cache entry was ignored"
-    budget = Budget(limits, cancel)
-    collector = EndpointCollector(limits)
+    collector = EndpointCollector(limits, budget)
     result = {
         "sha256": identity,
         "size": artifact["size"],
@@ -272,7 +318,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                                 data, limits, budget, inspect_code=mode != "quick"
                             )
                         except (AnalysisError, UnicodeError) as error:
-                            if isinstance(error, Cancelled):
+                            if isinstance(error, (Cancelled, MemoryBudgetExceeded)):
                                 raise
                             for item in printable_strings(data):
                                 consume(
@@ -303,16 +349,19 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                                 },
                                 index["references"].get(item["string_index"]),
                             )
-                        for method_index, method in enumerate(index["methods"]):
+                        for method_index in checked_range(
+                            len(index["methods"]), budget
+                        ):
                             add_signals(
-                                method,
+                                index["methods"][method_index],
                                 {
                                     **source,
                                     "kind": "dex_method_id",
                                     "method_index": method_index,
                                 },
                             )
-                        for call in index["calls"]:
+                        for call_index in checked_range(len(index["calls"]), budget):
+                            call = index["calls"][call_index]
                             add_signals(
                                 call["target"],
                                 {**source, **call, "kind": "dex_invocation"},
@@ -431,7 +480,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             elapsed_seconds=round(time.monotonic() - item_started, 4),
                         )
                     )
-                except Cancelled:
+                except (Cancelled, MemoryBudgetExceeded):
                     raise
                 except (
                     AnalysisError,
@@ -454,6 +503,10 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             str(error),
                         )
                     )
+    except MemoryBudgetExceeded as error:
+        result["resource_limited"] = True
+        cancel.set()
+        stages.append(stage("artifact_analysis", "PARTIAL", identity, str(error)))
     except Cancelled as error:
         stages.append(stage("artifact_analysis", "CANCELLED", identity, str(error)))
     except (
@@ -473,8 +526,34 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
             )
         )
     result["endpoints"] = collector.results()
-    for name, types in descriptors or [("archive", [])]:
-        result["sdks"].extend(sdk_matches(types, result["endpoints"], identity, name))
+    if not cancel.is_set():
+        try:
+            domain_matches = sdk_domain_matches(result["endpoints"], budget)
+            for name, types in descriptors or [("archive", [])]:
+                result["sdks"].extend(
+                    sdk_matches(
+                        types,
+                        result["endpoints"],
+                        identity,
+                        name,
+                        domain_matches,
+                        budget,
+                    )
+                )
+            budget.check()
+        except MemoryBudgetExceeded as error:
+            result["resource_limited"] = True
+            cancel.set()
+            stages.append(stage("sdk_matching", "PARTIAL", identity, str(error)))
+        except (Cancelled, BudgetExceeded) as error:
+            stages.append(
+                stage(
+                    "sdk_matching",
+                    "CANCELLED" if isinstance(error, Cancelled) else "PARTIAL",
+                    identity,
+                    str(error),
+                )
+            )
     stages.append(
         stage(
             "endpoint_extraction",
@@ -497,6 +576,19 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
             results=len(result["signals"]),
         )
     )
+    if (
+        cancel.is_set()
+        and not result.get("resource_limited")
+        and not any(item["status"] == "CANCELLED" for item in stages)
+    ):
+        stages.append(
+            stage(
+                "artifact_analysis",
+                "CANCELLED",
+                identity,
+                "Analysis cancelled before artifact completion",
+            )
+        )
     for item in stages:
         item["artifact"] = identity
     result["cache"] = {"hit": False, "key": key}
@@ -508,78 +600,148 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
         for item in stages
     ):
         try:
-            cache_write(cache_file, result)
+            cache_write(cache_file, result, cancel, budget)
+        except MemoryBudgetExceeded as error:
+            result["resource_limited"] = True
+            cancel.set()
+            stages.append(
+                stage(
+                    "result_cache", "PARTIAL", identity, str(error), artifact=identity
+                )
+            )
+        except (Cancelled, BudgetExceeded) as error:
+            stages.append(
+                stage(
+                    "result_cache",
+                    "CANCELLED" if isinstance(error, Cancelled) else "PARTIAL",
+                    identity,
+                    str(error),
+                    artifact=identity,
+                )
+            )
         except OSError:
             result["cache"]["notice"] = "Result cache could not be written"
     return result
 
 
-def analyze_many(artifacts, limits, mode, cancel, jobs, cache_directory, progress):
+def analyze_many(
+    artifacts,
+    limits,
+    mode,
+    cancel,
+    jobs,
+    cache_directory,
+    progress,
+    store=None,
+    resume_store=None,
+    retry_incomplete=False,
+    source_tool=None,
+):
     unique = {artifact["sha256"]: artifact for artifact in artifacts}
     pending = iter(sorted(unique.values(), key=lambda artifact: artifact["sha256"]))
-    results = {}
+    results = ArtifactResults(store) if store else {}
     active = {}
+    counts = {"complete": 0, "partial": 0, "failed": 0, "cancelled": 0}
+    done = 0
+
+    def record_completion(artifact, result, resumed=False):
+        nonlocal done
+        status = artifact_status(result)
+        counts[status.lower()] += 1
+        done += 1
+        progress(
+            {
+                "event": "artifact_complete",
+                "done": done,
+                "total": len(unique),
+                "artifact": artifact["sha256"],
+                "status": status,
+                "cache_hit": result["cache"]["hit"],
+                "resumed": resumed,
+                "persisted": store is not None,
+                **counts,
+            }
+        )
+
     with ThreadPoolExecutor(max_workers=jobs) as executor:
-        while True:
-            while not cancel.is_set() and len(active) < jobs:
-                artifact = next(pending, None)
-                if artifact is None:
+        try:
+            while True:
+                while not cancel.is_set() and len(active) < jobs:
+                    artifact = next(pending, None)
+                    if artifact is None:
+                        break
+                    if resume_store and resume_store.reusable(
+                        artifact["sha256"],
+                        cache_key(artifact["sha256"], limits, mode),
+                        retry_incomplete,
+                        source_tool,
+                    ):
+                        store.import_artifact(resume_store, artifact["sha256"])
+                        record_completion(
+                            artifact, results[artifact["sha256"]], resumed=True
+                        )
+                        continue
+                    active[
+                        executor.submit(
+                            analyze_artifact,
+                            artifact,
+                            limits,
+                            mode,
+                            cancel,
+                            cache_directory,
+                        )
+                    ] = artifact
+                if not active:
                     break
-                active[
-                    executor.submit(
-                        analyze_artifact,
-                        artifact,
-                        limits,
-                        mode,
-                        cancel,
-                        cache_directory,
-                    )
-                ] = artifact
-            if not active:
-                break
-            completed, _ = wait(active, timeout=0.2, return_when=FIRST_COMPLETED)
-            for future in completed:
-                artifact = active.pop(future)
-                try:
-                    result = future.result()
-                except (
-                    AnalysisError,
-                    OSError,
-                    ValueError,
-                    TypeError,
-                    KeyError,
-                    IndexError,
-                    RuntimeError,
-                    EOFError,
-                    ET.ParseError,
-                    struct.error,
-                ) as error:
-                    result = {
-                        "sha256": artifact["sha256"],
-                        "manifest": None,
-                        "endpoints": [],
-                        "signals": [],
-                        "sdks": [],
-                        "stages": [
-                            stage(
-                                "artifact_analysis",
-                                "FAILED",
-                                artifact["sha256"],
-                                f"{type(error).__name__}: {error}",
-                            )
-                        ],
-                        "cache": {"hit": False},
-                        "statistics": {},
-                    }
-                results[artifact["sha256"]] = result
-                progress(
-                    {
-                        "event": "artifact_complete",
-                        "done": len(results),
-                        "total": len(unique),
-                        "cache_hit": result["cache"]["hit"],
-                    }
-                )
+                completed, _ = wait(active, timeout=0.2, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    artifact = active.pop(future)
+                    try:
+                        result = future.result()
+                    except (
+                        AnalysisError,
+                        OSError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        IndexError,
+                        RuntimeError,
+                        EOFError,
+                        ET.ParseError,
+                        struct.error,
+                    ) as error:
+                        result = {
+                            "sha256": artifact["sha256"],
+                            "manifest": None,
+                            "endpoints": [],
+                            "signals": [],
+                            "sdks": [],
+                            "stages": [
+                                stage(
+                                    "artifact_analysis",
+                                    "CANCELLED"
+                                    if isinstance(error, Cancelled)
+                                    else "PARTIAL"
+                                    if isinstance(error, BudgetExceeded)
+                                    else "FAILED",
+                                    artifact["sha256"],
+                                    f"{type(error).__name__}: {error}",
+                                )
+                            ],
+                            "cache": {"hit": False},
+                            "statistics": {},
+                            "resource_limited": isinstance(error, MemoryBudgetExceeded),
+                        }
+                    if result.get("resource_limited"):
+                        cancel.set()
+                    results[artifact["sha256"]] = result
+                    record_completion(artifact, result)
+                    del result
+        except BaseException:
+            cancel.set()
+            for future in active:
+                future.cancel()
+            raise
     for identity in unique.keys() - results.keys():
         results[identity] = {
             "sha256": identity,
@@ -603,14 +765,15 @@ def analyze_many(artifacts, limits, mode, cancel, jobs, cache_directory, progres
 
 def source_view(artifact, output, executable, limits, cancel):
     started = time.monotonic()
+    resource_limited = False
     result = run_command(
         [executable, "--no-res", "-d", str(output), artifact["path"]],
         timeout=limits.timeout,
         cancel=cancel,
     )
-    collector = EndpointCollector(limits)
-    signals = []
     budget = Budget(limits, cancel)
+    collector = EndpointCollector(limits, budget)
+    signals = []
     total_bytes = 0
     files = 0
     stages = [
@@ -680,6 +843,9 @@ def source_view(artifact, output, executable, limits, cancel):
                 )
             )
     except (AnalysisError, OSError, UnicodeError) as error:
+        if isinstance(error, MemoryBudgetExceeded):
+            resource_limited = True
+            cancel.set()
         stages.append(
             stage(
                 "source_view",
@@ -693,6 +859,7 @@ def source_view(artifact, output, executable, limits, cancel):
         "signals": signals,
         "stages": stages,
         "elapsed_seconds": round(time.monotonic() - started, 3),
+        "resource_limited": resource_limited,
     }
 
 
@@ -719,9 +886,11 @@ def merge_records(records, limits):
     return list(merged.values()), truncated
 
 
-def build_apps(artifacts, results, snapshot, limits, mode):
+def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=None):
     groups = {}
     for artifact in artifacts:
+        if store:
+            store.check_cancel()
         result = results[artifact["sha256"]]
         manifest = result["manifest"]
         package = artifact.get("package_hint") or (
@@ -746,8 +915,10 @@ def build_apps(artifacts, results, snapshot, limits, mode):
                 (package, None),
                 {"package": package, "version_code": None, "artifacts": []},
             )
-    apps = []
+    apps = Apps(store) if store else []
     for _, group in sorted(groups.items(), key=lambda pair: str(pair[0])):
+        if store:
+            store.check_cancel()
         package = group["package"]
         installation = snapshot["packages"].get(package) if snapshot else None
         app = {
@@ -774,6 +945,9 @@ def build_apps(artifacts, results, snapshot, limits, mode):
             "installation": installation,
         }
         permission_map = {}
+        truncated_categories = set()
+        if store:
+            store.begin_app(app)
         base_count = 0
         splits = []
         versions = set()
@@ -781,7 +955,11 @@ def build_apps(artifacts, results, snapshot, limits, mode):
             result = results[artifact["sha256"]]
             app["coverage"].extend(result["stages"])
             for category in ("endpoints", "signals", "sdks"):
-                app[category].extend(result[category])
+                if store:
+                    if store.merge(app["id"], category, result[category], limits):
+                        truncated_categories.add(category)
+                else:
+                    app[category].extend(result[category])
             manifest = result["manifest"]
             if manifest:
                 app["manifests"].append({"artifact": artifact["sha256"], **manifest})
@@ -830,7 +1008,10 @@ def build_apps(artifacts, results, snapshot, limits, mode):
             key=lambda item: (item["name"], str(item["max_sdk"]), item["declaration"]),
         )
         for category in ("endpoints", "signals", "sdks"):
-            app[category], truncated = merge_records(app[category], limits)
+            if store:
+                truncated = category in truncated_categories
+            else:
+                app[category], truncated = merge_records(app[category], limits)
             if truncated:
                 app["coverage"].append(
                     stage(
@@ -914,18 +1095,41 @@ def build_apps(artifacts, results, snapshot, limits, mode):
                 )
             )
         app["capabilities"] = capabilities(app["permissions"], app["signals"])
-        build_findings(app)
+        build_findings(app, store)
         app["status"] = aggregate_status(app["coverage"])
-        apps.append(app)
+        if store:
+            store.save_app(app)
+        else:
+            apps.append(app)
+        if progress:
+            progress(
+                {
+                    "event": "app_complete",
+                    "done": len(apps),
+                    "total": len(groups),
+                    "app_id": app["id"],
+                    "status": app["status"],
+                }
+            )
     return apps
 
 
-def build_findings(app):
+def build_findings(app, store=None):
     findings = app["findings"]
-    for endpoint in app["endpoints"]:
-        if "telemetry_path_candidate" in endpoint["tags"]:
-            findings.append(
-                {
+
+    @lru_cache(maxsize=SDK_HOST_CACHE_SIZE)
+    def sdk_candidates(host):
+        return tuple(
+            name
+            for name, purpose, _, domains in SDK_RULES
+            if purpose in {"analytics", "attribution", "diagnostics", "advertising"}
+            and any(host_matches(host, suffix) for suffix in domains)
+        )
+
+    def endpoint_findings():
+        for endpoint in app["endpoints"]:
+            if "telemetry_path_candidate" in endpoint["tags"]:
+                yield {
                     "id": stable_id("finding", app["id"], endpoint["id"]),
                     "type": "telemetry_endpoint_candidate",
                     "evidence_level": endpoint["evidence_level"],
@@ -933,20 +1137,15 @@ def build_findings(app):
                     "evidence_ids": [item["id"] for item in endpoint["evidence"]],
                     "meaning": "Path naming suggests telemetry; data collection and transmission are unproven",
                 }
-            )
-        if endpoint.get("host"):
-            matches = [
-                name
-                for name, purpose, _, domains in SDK_RULES
-                if purpose in {"analytics", "attribution", "diagnostics", "advertising"}
-                and any(host_matches(endpoint["host"], suffix) for suffix in domains)
-            ]
-            if matches:
-                endpoint["tags"] = sorted(
-                    set(endpoint["tags"]) | {"sdk_telemetry_domain_candidate"}
-                )
-                findings.append(
-                    {
+            if endpoint.get("host"):
+                matches = list(sdk_candidates(endpoint["host"]))
+                if matches:
+                    endpoint["tags"] = sorted(
+                        set(endpoint["tags"]) | {"sdk_telemetry_domain_candidate"}
+                    )
+                    if store:
+                        store.update_record(app["id"], "endpoints", endpoint)
+                    yield {
                         "id": stable_id("sdk_endpoint", app["id"], endpoint["id"]),
                         "type": "sdk_endpoint_candidate",
                         "evidence_level": endpoint["evidence_level"],
@@ -955,18 +1154,21 @@ def build_findings(app):
                         "evidence_ids": [item["id"] for item in endpoint["evidence"]],
                         "meaning": "Host matches a maintained SDK rule; ownership and actual network use are unverified",
                     }
-                )
-    events = [
-        item
-        for item in app["signals"]
-        if item["type"] in {"telemetry_event", "diagnostic_field"}
-    ]
+
+    findings.extend(endpoint_findings())
+    events = []
+    event_level = "E0"
+    for item in app["signals"]:
+        if item["type"] in {"telemetry_event", "diagnostic_field"}:
+            event_level = max(event_level, item["evidence_level"])
+            if len(events) < 20:
+                events.append(item)
     if events:
         findings.append(
             {
                 "id": stable_id("telemetry_implementation", app["id"]),
                 "type": "telemetry_implementation_candidate",
-                "evidence_level": max(item["evidence_level"] for item in events),
+                "evidence_level": event_level,
                 "evidence_ids": [
                     evidence["id"]
                     for item in events[:20]
@@ -988,7 +1190,9 @@ def build_findings(app):
         app["recommendations"].append(
             {
                 "action": "review_static_evidence",
-                "finding_ids": [item["id"] for item in findings],
+                "finding_ids": FindingIds(findings)
+                if store
+                else [item["id"] for item in findings],
                 "requires_device_change": False,
             }
         )

@@ -34,6 +34,8 @@ python3 scripts/analyze.py scan \
 
 Artifacts are grouped by package name and version from their manifests. Distinct packages are analyzed separately; differing versions of the same package produce separate results. Missing splits, duplicated base files, version conflicts, and unreadable identities are recorded in coverage metadata. Local inputs cannot prove that all device splits were provided, nor do they include runtime grant state.
 
+Artifacts are checkpointed in `analysis.sqlite3` as each parsing job returns, before application aggregation. Queries can use this database after a report has been finalized; if a task stops earlier, resume it first. The compatible `analysis.json` export retains `schema_version: 1` and is written incrementally rather than assembled into a single string.
+
 Quick preview mode:
 
 ```sh
@@ -69,6 +71,50 @@ Device interactions are restricted to package inventory, `dumpsys package`, `set
 
 ADB output formatting varies by vendor; unparseable blocks or permission denials are recorded in `coverage`. AppOps `default` is not interpreted as granted; unlisted permissions or special access settings cannot be assumed denied.
 
+## Offline Snapshots and Recovery
+
+For a long device acquisition, check free disk space first. Acquisition and analysis may be separated explicitly:
+
+```sh
+python3 scripts/analyze.py scan \
+  --device SERIAL --user 0 --collect-only \
+  --output .dev/analysis/collection-001
+
+python3 scripts/analyze.py scan \
+  --snapshot .dev/analysis/collection-001/snapshot.json \
+  --output .dev/analysis/offline-001
+```
+
+The snapshot records artifact hashes and paths, selected targets, collection stages, and captured device grants, AppOps, and special access. It is atomically updated after individual pulls and packages. `collection_complete` means acquisition reached its end, not that every pull or metadata lookup succeeded; inspect stage statuses. Offline analysis verifies saved APK sizes and SHA-256 hashes without copying them or contacting the device. Keep referenced task directories intact; missing or changed APKs fail verification. An interrupted collection remains partial, with uncollected targets explicitly represented rather than silently omitted.
+
+When a saved collection is restored, historical `CANCELLED` stages become `PARTIAL` coverage gaps and retain `original_status: CANCELLED`. The source snapshot is unchanged. Only a cancellation of the current execution returns exit code `130`; the historical acquisition interruption does not cancel a completed offline analysis.
+
+Resume parsing into a new directory:
+
+```sh
+python3 scripts/analyze.py scan \
+  --resume .dev/analysis/offline-001 \
+  --output .dev/analysis/resumed-001
+```
+
+- Stop the original task before resuming. Existing reports and artifacts are never overwritten. SQLite rollback recovery, when required after a crash, runs on a private temporary database copy in the new output directory; allow additional free space for that copy.
+- Compatible `COMPLETE` and `PARTIAL` artifact checkpoints are reused. `FAILED`, `CANCELLED`, missing, and memory-interrupted checkpoints are retried. Add `--retry-incomplete` to retry other `PARTIAL` results; this verifies saved stage facts even if a previous import incorrectly recorded completion metadata. Source tasks remain unchanged.
+- Mode, coverage budgets, requested concurrency, and explicit memory budget inherit from `snapshot.json` unless overridden. Changing semantic limits or mode invalidates the corresponding checkpoint/cache identity and triggers parsing again. An automatic memory budget is recalculated for the current host and does not invalidate compatible facts.
+- External executables are never restored as implicit execution instructions. Pass `--jadx` explicitly when supplemental decompilation must be rerun. Changing the selected jadx path prevents reuse of completed supplemental results.
+- A collection-only task can be passed to `--resume`; without a database, artifacts are parsed normally. `--snapshot` reuses acquisition only and does not import prior parsing checkpoints.
+- Tasks created by older versions without `snapshot.json` cannot use this recovery entrypoint. Supply their local base/split APKs with repeated `--apk` and point `--cache-dir` to a known existing cache. That path creates fresh input snapshots; device state and partial parse results absent from durable outputs cannot be reconstructed from APKs.
+
+Older interrupted scans could incorrectly save a `COMPLETE` checkpoint when cancellation skipped SDK matching. Such checkpoints contain no cancellation stage, so `--retry-incomplete` cannot identify them reliably. For a task known to be affected, rebuild parsing from its saved collection without importing checkpoints or reading analysis caches:
+
+```sh
+python3 scripts/analyze.py scan \
+  --snapshot .dev/analysis/interrupted-001/snapshot.json \
+  --no-cache \
+  --output .dev/analysis/reparsed-001
+```
+
+This verifies and reuses the saved APKs and device snapshot, preserving the source task without contacting the device. Current scans check method/call signal loops and completion boundaries independently of caching, so cancellations produce retryable checkpoints.
+
 ## Supplemental Decompiled Source Analysis
 
 ```sh
@@ -86,18 +132,18 @@ If `--jadx` is omitted, base static analysis executes and the supplemental decom
 ## Querying Existing Results
 
 ```sh
-python3 scripts/query_results.py .dev/analysis/local-001/analysis.json
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3
 
-python3 scripts/query_results.py .dev/analysis/local-001/analysis.json \
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
   --section apps --offset 0 --limit 20
 
-python3 scripts/query_results.py .dev/analysis/local-001/analysis.json \
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
   --section endpoints --package com.example.app --limit 50
 
-python3 scripts/query_results.py .dev/analysis/local-001/analysis.json \
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
   --section coverage --package com.example.app --limit 100
 
-python3 scripts/query_results.py .dev/analysis/local-001/analysis.json \
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
   --section evidence --id EVIDENCE_ID
 ```
 
@@ -105,10 +151,14 @@ Available sections: `summary`, `apps`, `permissions`, `capabilities`, `endpoints
 
 Pagination limits range from 1 to 500; inspect `total` to determine subsequent pages. URL query parameters, fragments, and credentials are redacted by default; `--include-sensitive` is reserved for authorized local inspection of original values.
 
+New SQLite databases apply exact IDs, counts, and pagination to indexed facts; evidence IDs use persisted references instead of rescanning every endpoint and signal. Summaries use committed lightweight application views, and Markdown stops reading display collections at the requested row limits. Substring filters preserve Unicode casefold behavior and can still scan candidates; known package scopes and exact IDs narrow that work. Deep offsets and exact counts can still traverse indexes. Legacy `analysis.json` remains accepted, but is loaded as a whole and rejected above 256 MiB; use the explicit `analysis.sqlite3` path for large reports. A database is authoritative only for its own task; the query command does not silently substitute a neighboring database for a requested JSON file.
+
+New tasks write `store_version: 2`, including compact views and evidence references committed with application facts. Current scripts also read version 1 databases through compatible, potentially slower paths. Resume builds version 2 in a new output directory without modifying the source; there is no in-place migration. Older scripts cannot read version 2 databases; the schema 1 JSON export remains compatible. Evidence references add disk space but do not duplicate evidence bodies.
+
 ## Re-exporting Reports
 
 ```sh
-python3 scripts/export_report.py .dev/analysis/local-001/analysis.json \
+python3 scripts/export_report.py .dev/analysis/local-001/analysis.sqlite3 \
   --output .dev/analysis/export-001 \
   --view-limit 200
 ```
@@ -120,6 +170,9 @@ Exports summary JSON, Markdown, all domain candidates, and telemetry domain cand
 | File | Meaning |
 |---|---|
 | `analysis.json` | Versioned machine-readable results including facts, evidence, coverage, and input paths; may contain sensitive original values |
+| `analysis.sqlite3` | Durable artifact checkpoints, finalized facts, and query projections; preferred input for large queries and re-exports, with independent `store_version: 2` |
+| `snapshot.json` | Reusable collection manifest, analysis configuration, artifact identities/paths, and available device state; may contain sensitive values |
+| `progress.json` | Last task milestone; inspect database checkpoints and coverage for authoritative completion |
 | `summary.json` | Redacted summary with an overview of up to 20 applications |
 | `report.md` | Base Markdown report with bounded table views (default 100 rows per table) |
 | `domains.txt` | All extracted host and bare-domain candidates; may include documentation, package names, or test fixtures |
@@ -133,6 +186,10 @@ Exports summary JSON, Markdown, all domain candidates, and telemetry domain cand
 - `2`: Command-line syntax error.
 - `130`: Interrupted or cancelled; partial results are preserved where possible and marked `CANCELLED`.
 
+A cooperative memory stop also interrupts dispatch and returns `130`; stdout and `progress.json` identify `stop_reason: memory_budget`. Missing jobs are checkpointed as cancelled, and resource-interrupted facts are retried on resume. Cancellation during aggregation or export stops further record processing and preserves committed checkpoints; final report files may be absent until the task is resumed. `done` progress counts returned jobs, not successful parsers: artifact events include status counts, persistence, and checkpoint reuse; application aggregation, export, and final completion have separate milestones. Per-artifact checkpoints commit before progress announces persistence.
+
+The RSS guard also covers checkpoint imports, application aggregation, and report export, including tasks that reuse every artifact. A stop in these phases preserves valid committed artifact checkpoints without marking them as incomplete parsing results; an unfinished import or application transaction is rolled back. Fatal checkpoint or progress-write errors stop other workers cooperatively before returning the original failure with exit code `1`.
+
 Existing output directories are never overwritten. Historical reports, snapshots, and caches are not automatically purged.
 
 ## Resources and Caching
@@ -145,14 +202,21 @@ python3 scripts/analyze.py scan \
   --max-entry-mib 128 \
   --max-total-mib 512 \
   --max-results 50000 \
+  --memory-mib 4096 \
   --cache-dir .dev/cache/static-analysis \
   --output .dev/analysis/budget-001
 ```
 
 Default limits: maximum 1 GiB input APK, 128 MiB per entry, 512 MiB total inspected member bytes, 30,000 ZIP entries, 500,000 DEX/resource strings, 1 MiB per string, 50,000 endpoints/signals each, and 20 evidence items per endpoint. `--jobs` ranges from 1 to 8 (default: 2).
 
-These limits are cooperative in-process budgets, not OS-level sandboxing. External jadx output does not have hard disk quotas; untrusted or oversized artifacts should be analyzed in dedicated restricted environments.
+These limits are cooperative in-process budgets, not OS-level sandboxing. On Linux, process RSS is sampled and available host/cgroup memory informs a default budget with headroom; requested worker concurrency can be reduced conservatively. `--memory-mib` overrides the process RSS budget. On hosts without RSS sampling, preflight reports that the guard is unavailable. Native allocations, single large operations, external jadx, and concurrent memory users can exceed cooperative estimates. External jadx output does not have hard memory or disk quotas; untrusted or oversized artifacts should be analyzed in dedicated restricted environments.
+
+Resource/XML string pools and DEX tables check cancellation, timeout, and RSS during parsing and at phase completion, including quick-mode non-instruction tables. String decoding also checks by processed byte volume to observe repeated-offset expansion. Memory stops preserve retryable checkpoints; class-scan timeouts retain the existing partial-coverage semantics.
+
+The number of retained completed artifacts no longer determines the parser's live working set: worker results are committed to SQLite and released. Application merging, evidence deduplication, domain projection, and the JSON export stream records from disk, including for a large single application. This increases disk use: allow space for both SQLite facts and the compatible JSON export, plus retained APKs and any recovery copy. Do not use a fixed application count as a memory guarantee or disable resource protection when expanding coverage.
 
 The cache defaults to a sibling `cache/` directory relative to the output directory. Cache keys incorporate input SHA-256, engine and rule versions, mode, and budgets. Duplicated content within a run is parsed only once. Failed, partial, or unreadable runs are not cached as successes; corrupt caches are discarded and recalculated. `--no-cache` disables analysis caching without skipping input snapshotting.
+
+Cache entries and task checkpoints have different lifetimes: partial results still receive a transactional checkpoint even when ineligible for the successful-result cache. Existing cache checksums and semantic cache keys remain compatible. Caches continue to load one artifact at a time with a 256 MiB JSON limit; an oversized or invalid cache is ignored and reparsed, rather than treated as completed evidence.
 
 Integrity verification requires reading APK bytes. Input snapshots are captured per run to ensure subsequent evidence references the exact bytes analyzed.

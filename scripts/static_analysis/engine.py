@@ -36,8 +36,10 @@ from .common import (
     stable_id,
     stage,
 )
+from .dataflow import MODEL_VERSION, analyze_dataflow, evidence_path_key
 from .endpoints import EndpointCollector, host_matches
 from .manifest import analyze_manifest
+from .privacy_models import SENSITIVE_SIGNALS
 from .rules import (
     RULE_VERSION,
     SDK_RULES,
@@ -75,6 +77,7 @@ def cache_key(identity, limits, mode):
         "engine": ENGINE_VERSION,
         "schema": SCHEMA_VERSION,
         "rules": RULE_VERSION,
+        "dataflow_model": MODEL_VERSION,
         "limits": limits.signature(),
         "mode": mode,
     }
@@ -148,6 +151,8 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
         "endpoints": [],
         "signals": [],
         "sdks": [],
+        "methods": [],
+        "fields": [],
         "stages": [],
         "statistics": {
             "entries": 0,
@@ -159,6 +164,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     }
     stages = result["stages"]
     descriptors = []
+    structure_budget = {"methods": 0, "units": 0}
     total_read = 0
     signal_ids = set()
     signals_truncated = False
@@ -315,7 +321,11 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                         result["statistics"]["dex_files"] += 1
                         try:
                             index = dex_index(
-                                data, limits, budget, inspect_code=mode != "quick"
+                                data,
+                                limits,
+                                budget,
+                                inspect_code=mode != "quick",
+                                structure_budget=structure_budget,
                             )
                         except (AnalysisError, UnicodeError) as error:
                             if isinstance(error, (Cancelled, MemoryBudgetExceeded)):
@@ -338,6 +348,68 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             "scanned_methods"
                         ]
                         descriptors.append((name, index["types"]))
+                        for body in index["bodies"]:
+                            budget.check()
+                            result["methods"].append(
+                                {
+                                    "id": stable_id(
+                                        "method",
+                                        identity,
+                                        name,
+                                        body["signature"],
+                                        body.get("code_offset"),
+                                    ),
+                                    "artifact": identity,
+                                    "entry": name,
+                                    **body,
+                                }
+                            )
+                        fields_truncated = False
+                        for field_index, field in enumerate(index["fields"]):
+                            if field_index % 256 == 0:
+                                budget.check()
+                            if len(result["fields"]) < limits.max_results:
+                                result["fields"].append(
+                                    {
+                                        "id": stable_id(
+                                            "field", identity, name, field_index
+                                        ),
+                                        "signature": field,
+                                        "artifact": identity,
+                                        "entry": name,
+                                    }
+                                )
+                            else:
+                                fields_truncated = True
+                            add_signals(
+                                field,
+                                {
+                                    **source,
+                                    "kind": "dex_field",
+                                    "field_index": field_index,
+                                },
+                            )
+                        if fields_truncated:
+                            index["structure_gaps"].append(
+                                "DEX field index budget exceeded"
+                            )
+                        stages.append(
+                            stage(
+                                "dex_structure_index",
+                                "DEFERRED"
+                                if mode == "quick"
+                                else "PARTIAL"
+                                if index["structure_gaps"] or index["gaps"]
+                                else "COMPLETE",
+                                name,
+                                "Quick mode excludes method bodies"
+                                if mode == "quick"
+                                else "; ".join(index["structure_gaps"] + index["gaps"])
+                                or None,
+                                methods=len(index["bodies"]),
+                                fields=len(index["fields"]),
+                            )
+                        )
                         for item in index["strings"]:
                             consume(
                                 item["value"],
@@ -749,6 +821,8 @@ def analyze_many(
             "endpoints": [],
             "signals": [],
             "sdks": [],
+            "methods": [],
+            "fields": [],
             "stages": [
                 stage(
                     "artifact_analysis",
@@ -936,6 +1010,8 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
             "user": snapshot["user"] if snapshot else None,
             "artifacts": group["artifacts"],
             "manifests": [],
+            "methods": [],
+            "fields": [],
             "permissions": [],
             "endpoints": [],
             "signals": [],
@@ -954,12 +1030,14 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
         for artifact in group["artifacts"]:
             result = results[artifact["sha256"]]
             app["coverage"].extend(result["stages"])
-            for category in ("endpoints", "signals", "sdks"):
+            for category in ("endpoints", "signals", "sdks", "methods", "fields"):
                 if store:
-                    if store.merge(app["id"], category, result[category], limits):
+                    if store.merge(
+                        app["id"], category, result.get(category, ()), limits
+                    ):
                         truncated_categories.add(category)
                 else:
-                    app[category].extend(result[category])
+                    app[category].extend(result.get(category, ()))
             manifest = result["manifest"]
             if manifest:
                 app["manifests"].append({"artifact": artifact["sha256"], **manifest})
@@ -1007,7 +1085,7 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
             permission_map.values(),
             key=lambda item: (item["name"], str(item["max_sdk"]), item["declaration"]),
         )
-        for category in ("endpoints", "signals", "sdks"):
+        for category in ("endpoints", "signals", "sdks", "methods", "fields"):
             if store:
                 truncated = category in truncated_categories
             else:
@@ -1032,6 +1110,13 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
                 None
                 if complete_set
                 else "Missing or duplicate base/split, or conflicting artifact versions; completeness cannot be established",
+                available_artifacts=len(group["artifacts"]),
+                parsed_manifests=len(app["manifests"]),
+                base_count=base_count,
+                supplied_splits=len(splits),
+                installed_split_total_known=bool(
+                    snapshot and installation and complete_set
+                ),
             )
         )
         if not snapshot:
@@ -1060,18 +1145,6 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
                     "String pools are parsed; resource IDs and qualified effective values are not resolved",
                 ),
                 stage(
-                    "method_dataflow_E3",
-                    "UNAVAILABLE",
-                    package,
-                    "Register and object dataflow analysis is not implemented",
-                ),
-                stage(
-                    "interprocedural_dataflow_E4",
-                    "UNAVAILABLE",
-                    package,
-                    "Cross-method dataflow analysis is not implemented",
-                ),
-                stage(
                     "native_semantics",
                     "UNAVAILABLE",
                     package,
@@ -1095,6 +1168,17 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
                 )
             )
         app["capabilities"] = capabilities(app["permissions"], app["signals"])
+        if mode == "quick":
+            app["coverage"].extend(
+                stage(name, "DEFERRED", package, "Quick mode excludes dataflow")
+                for name in ("method_dataflow_E3", "interprocedural_dataflow_E4")
+            )
+        else:
+            flows, coverage = analyze_dataflow(
+                app["methods"], limits, store.cancel if store else None
+            )
+            app["findings"].extend(flows)
+            app["coverage"].extend(coverage)
         build_findings(app, store)
         app["status"] = aggregate_status(app["coverage"])
         if store:
@@ -1116,6 +1200,15 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
 
 def build_findings(app, store=None):
     findings = app["findings"]
+    flow_count = len(findings)
+    evidence_path_count = len(
+        {
+            evidence_path_key(
+                item["data_category"], item["evidence_ids"], item["sink"]["endpoints"]
+            )
+            for item in findings
+        }
+    )
 
     @lru_cache(maxsize=SDK_HOST_CACHE_SIZE)
     def sdk_candidates(host):
@@ -1156,6 +1249,65 @@ def build_findings(app, store=None):
                     }
 
     findings.extend(endpoint_findings())
+    important = {}
+    for signal in app["signals"]:
+        if signal["type"] in SENSITIVE_SIGNALS:
+            previous = important.get(signal["type"])
+            if (
+                previous is None
+                or signal["evidence_level"] > previous["evidence_level"]
+            ):
+                important[signal["type"]] = signal
+    for name, signal in sorted(important.items()):
+        findings.append(
+            {
+                "id": stable_id("privacy_capability", app["id"], name),
+                "type": "privacy_capability_candidate",
+                "data_category": name,
+                "relation": "capability_only",
+                "evidence_level": signal["evidence_level"],
+                "evidence_ids": [item["id"] for item in signal["evidence"]],
+                "meaning": "Sensitive static capability requires review; no transmission association or actual use is established",
+            }
+        )
+    declared_categories = {
+        "installed_apps": "installed_apps_api",
+        "device_identity": "device_identifier",
+        "screen": "screen_capture",
+        "microphone": "audio_capture",
+    }
+    for capability in app["capabilities"]:
+        name = declared_categories.get(capability["type"])
+        if name and name not in important:
+            evidence = [
+                {
+                    "id": stable_id("declared_privacy", app["id"], permission),
+                    "kind": "manifest_or_snapshot_permission",
+                    "excerpt": permission,
+                    "artifacts": sorted(
+                        {
+                            artifact
+                            for item in app["permissions"]
+                            if item["name"] == permission
+                            for artifact in item.get("artifacts", ())
+                        }
+                    ),
+                }
+                for permission in capability.get("permissions", ())
+            ]
+            important[name] = {"evidence_level": "E0"}
+            findings.append(
+                {
+                    "id": stable_id("privacy_capability", app["id"], name),
+                    "type": "privacy_capability_candidate",
+                    "data_category": name,
+                    "relation": "declared_capability_only",
+                    "evidence_level": "E0",
+                    "evidence": evidence,
+                    "evidence_ids": [item["id"] for item in evidence],
+                    "meaning": "Declared or captured permission capability requires review; API use and data transmission are unproven",
+                }
+            )
     events = []
     event_level = "E0"
     for item in app["signals"]:
@@ -1182,7 +1334,12 @@ def build_findings(app, store=None):
         manifest["application"]["debuggable"] is True for manifest in app["manifests"]
     )
     app["priority"] = {
-        "score": sensitive + min(len(findings), 10) + manifest_flags * 2,
+        "score": sensitive
+        + min(len(findings) - flow_count + evidence_path_count, 10)
+        + manifest_flags * 2
+        + min(len(important), 10) * 3
+        + min(evidence_path_count, 10) * 5,
+        "reasons": sorted(important),
         "meaning": "Review ordering heuristic, not a measured leakage or exploit probability",
     }
     app["recommendations"] = []

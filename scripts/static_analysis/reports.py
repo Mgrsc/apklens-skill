@@ -19,7 +19,8 @@ from .common import (
 from .endpoints import sanitized
 from .storage import (
     COMPLETE_COVERAGE_STATUSES,
-    STORE_VERSION,
+    EVIDENCE_SECTIONS,
+    INDEXED_STORE_VERSION,
     AnalysisStore,
     Apps,
     Records,
@@ -36,6 +37,8 @@ SECTIONS = (
     "findings",
     "coverage",
     "evidence",
+    "methods",
+    "fields",
 )
 
 
@@ -80,12 +83,15 @@ def app_summary(app):
 def summary(report, cancel=None, budget=None):
     check_resources(cancel, budget)
     statuses = Counter(item["status"] for item in report.get("stages", []))
+    review_total = 0
 
     def applications():
+        nonlocal review_total
         for app in report["apps"]:
             check_resources(cancel, budget)
             view = _application_view(app)
             statuses.update(view["coverage_counts"])
+            review_total += bool(view["summary"]["priority"].get("reasons"))
             yield view["summary"]
 
     ranked = heapq.nsmallest(
@@ -104,6 +110,13 @@ def summary(report, cancel=None, budget=None):
             "apps": ranked,
             "apps_view_truncated": len(report["apps"]) > 20,
             "apps_total": len(report["apps"]),
+            "apps_not_shown": max(0, len(report["apps"]) - len(ranked)),
+            "review_required_total": review_total,
+            "review_required_not_shown": max(
+                0,
+                review_total
+                - sum(bool(item["priority"].get("reasons")) for item in ranked),
+            ),
         }
     )
 
@@ -123,26 +136,29 @@ def section_rows(report, section, package=None, identity=None):
                 store = report["apps"].store
                 evidence_rows = (
                     store.evidence_page(app["id"], identity=identity)
-                    if store.version >= STORE_VERSION
+                    if store.version >= INDEXED_STORE_VERSION
                     else store.evidence(app["id"])
                 )
                 for evidence in evidence_rows:
                     yield {**owner, **evidence}
                 continue
             seen = set()
-            for category in ("endpoints", "sdks", "signals"):
-                for item in app[category]:
+            for category in EVIDENCE_SECTIONS:
+                for item in app.get(category, ()):
                     for evidence in item.get("evidence", []):
                         if evidence["id"] not in seen:
                             seen.add(evidence["id"])
                             yield {**owner, **evidence}
         else:
-            values = app[section]
+            values = app.get(section, ())
             if (
                 identity
                 and isinstance(values, Records)
                 and section != "coverage"
-                and (section != "findings" or values.store.version >= STORE_VERSION)
+                and (
+                    section != "findings"
+                    or values.store.version >= INDEXED_STORE_VERSION
+                )
             ):
                 values = values.page(identity=identity)
             for item in values:
@@ -175,12 +191,12 @@ def _indexed_query(report, section, package, offset, limit, identity):
             store = report["apps"].store
             count = store.evidence_count(app["id"], identity)
             page = partial(store.evidence_page, app["id"], identity=identity)
-        elif isinstance(app[section], Records):
+        elif isinstance(app.get(section), Records):
             records = app[section]
             count = records.count_records(identity)
             page = partial(records.page, identity=identity)
         else:
-            take({**owner, **item} for item in app[section])
+            take({**owner, **item} for item in app.get(section, ()))
             continue
         start = max(0, offset - total)
         remaining = max(0, limit - len(selected))
@@ -206,8 +222,10 @@ def query(
         store
         and not contains
         and not (identity and section == "coverage")
-        and not (store.version < STORE_VERSION and section == "evidence")
-        and not (store.version < STORE_VERSION and identity and section == "findings")
+        and not (store.version < INDEXED_STORE_VERSION and section == "evidence")
+        and not (
+            store.version < INDEXED_STORE_VERSION and identity and section == "findings"
+        )
     )
     if indexed:
         total, selected = _indexed_query(

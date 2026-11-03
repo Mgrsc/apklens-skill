@@ -370,8 +370,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(apps[0]["artifacts"]), 2)
         self.assertTrue(
             any(
-                item["stage"] == "method_dataflow_E3"
-                and item["status"] == "UNAVAILABLE"
+                item["stage"] == "method_dataflow_E3" and item["status"] == "PARTIAL"
                 for item in apps[0]["coverage"]
             )
         )
@@ -545,7 +544,7 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(statuses["decompilation"], "FAILED")
                 else:
                     self.assertNotIn("decompilation", statuses)
-                self.assertEqual(statuses["method_dataflow_E3"], "UNAVAILABLE")
+                self.assertEqual(statuses["method_dataflow_E3"], "PARTIAL")
 
     def test_cli_rejects_removed_mode_and_jadx_outside_decompile(self):
         apk = make_apk(self.root / "input.apk")

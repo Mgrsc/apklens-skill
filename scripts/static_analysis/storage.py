@@ -19,15 +19,24 @@ from .common import (
     check_resources,
 )
 
-STORE_VERSION = 2
-READABLE_STORE_VERSIONS = (1, STORE_VERSION)
+STORE_VERSION = 3
+INDEXED_STORE_VERSION = 2
+READABLE_STORE_VERSIONS = (1, 2, STORE_VERSION)
 SQLITE_PRIMARY_CODE_MASK = 0xFF
 SQLITE_READONLY_PRIMARY_CODE = 8
 STORE_CACHE_KIB = 8192
 EVIDENCE_CACHE_KIB = 1024
-ARTIFACT_SECTIONS = ("endpoints", "signals", "sdks", "stages")
-APP_SECTIONS = ("endpoints", "signals", "sdks", "coverage", "findings")
-EVIDENCE_SECTIONS = ("endpoints", "sdks", "signals")
+ARTIFACT_SECTIONS = ("endpoints", "signals", "sdks", "stages", "methods", "fields")
+APP_SECTIONS = (
+    "endpoints",
+    "signals",
+    "sdks",
+    "coverage",
+    "findings",
+    "methods",
+    "fields",
+)
+EVIDENCE_SECTIONS = ("endpoints", "sdks", "signals", "findings")
 EVIDENCE_INSERT_BATCH = 512
 COMPLETE_COVERAGE_STATUSES = {"COMPLETE", "NOT_APPLICABLE", "EXCLUDED"}
 
@@ -212,7 +221,7 @@ class FindingIds(Sequence):
     def __iter__(self):
         if (
             isinstance(self.records, Records)
-            and self.records.store.version >= STORE_VERSION
+            and self.records.store.version >= INDEXED_STORE_VERSION
         ):
             return self.records.store.finding_ids(self.records.owner)
         return (item["id"] for item in self.records)
@@ -392,7 +401,9 @@ class AnalysisStore:
             )
             for section in ARTIFACT_SECTIONS:
                 self.positions.pop(("artifact", identity, section), None)
-                self.append_records("artifact", identity, section, result[section])
+                self.append_records(
+                    "artifact", identity, section, result.get(section, ())
+                )
             self.connection.execute(
                 "INSERT OR REPLACE INTO artifacts VALUES (?,?,?)",
                 (
@@ -621,7 +632,7 @@ class AnalysisStore:
         )
 
     def app_view(self, app):
-        if self.version < STORE_VERSION:
+        if self.version < INDEXED_STORE_VERSION:
             return application_view(app)
         value = self.metadata("app_view:" + app["id"])
         if not isinstance(value, dict):
@@ -701,7 +712,7 @@ class AnalysisStore:
         return app
 
     def evidence(self, app_id):
-        if self.version >= STORE_VERSION:
+        if self.version >= INDEXED_STORE_VERSION:
             yield from self.evidence_page(app_id)
             return
         seen = sqlite3.connect("")

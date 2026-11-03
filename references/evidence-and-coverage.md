@@ -7,10 +7,12 @@
 | E0 | Data access capabilities declared by manifest permissions | Implemented |
 | E1 | Clues from static strings, SDK namespaces, method tables, and source keywords | Implemented |
 | E2 | Direct method references in DEX `const-string`, or matched bytecode invocations | Implemented |
-| E3 | Intra-method register/object propagation to network sinks | Not implemented, `UNAVAILABLE` |
-| E4 | Bounded inter-method dataflow propagation | Not implemented, `UNAVAILABLE` |
+| E3 | Intra-method register/object propagation to modeled network sinks | Bounded implementation; inspect model and coverage gaps |
+| E4 | Bounded inter-method dataflow propagation | Bounded implementation; resolved calls and selected asynchronous handoffs |
 
 E2 for a URL indicates only that an instruction references the string. E2 for an invocation signal indicates only that the call instruction exists. Their presence in the same method does not prove that the URL, event fields, and identifiers are linked in an active transmission path.
+
+E3/E4 findings contain ordered source, transformation and sink evidence, modeled branch conditions, and resolved-candidate or unresolved endpoint status. They establish possible paths within the declared model, not observed execution. All indexed definitions are candidate roots; a path can belong to unreachable or disabled code. Legal, authorized transmission remains a dataflow positive and is not automatically a privacy violation. Sensitive capabilities also produce separate review candidates without requiring telemetry keywords or known vendor domains. See [privacy models and limits](privacy-analysis.md).
 
 SDK detection records namespaces, domains, or composite rules. Domain matching respects full host and subdomain boundaries rather than arbitrary substrings; for example, `sentry.io` does not match `sentry.io.evil.example`. The presence of an SDK does not prove it is enabled, and broad vendor namespaces do not equate to telemetry.
 
@@ -55,7 +57,7 @@ Components preserve explicit exported status, target SDK default derivations, ap
 
 Restored collection stages use `PARTIAL` with `original_status: CANCELLED` to preserve a historical acquisition interruption without treating it as cancellation of the current execution. Referenced source snapshots remain unchanged.
 
-E3/E4 dataflow, complete resource evaluation, and native semantic analysis are not implemented; normal full runs typically produce an overall status of `PARTIAL`.
+Dataflow is bounded by supported instructions, external models, paths and resources. Unknown invocations, native/abstract methods, unresolved callbacks, unsupported instructions and exhausted budgets are reported in dataflow stage metrics. Quick mode defers method bodies and E3/E4. Complete resource evaluation, native semantics and actual runtime verification remain unavailable; normal runs can still have overall status `PARTIAL`.
 
 Job completion, artifact coverage, and final report completion are separate facts. Progress `done` includes failed jobs; inspect per-status counts and stages. A durable checkpoint can contain partial evidence without qualifying as a successful cache entry. A resumed partial collection preserves missing targets as gaps, and never upgrades uncollected APKs or uncaptured grant state to complete coverage.
 

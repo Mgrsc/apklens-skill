@@ -339,7 +339,7 @@ class PerformanceTests(unittest.TestCase):
                     resume_store=legacy,
                 )
             self.assertEqual(len(results), len(report["artifacts"]))
-            self.assertEqual(target.version, 2)
+            self.assertEqual(target.version, storage.STORE_VERSION)
         finally:
             legacy.close()
         self.assertEqual(path.read_bytes(), before)

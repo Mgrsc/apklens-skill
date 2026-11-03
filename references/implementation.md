@@ -29,6 +29,9 @@ SKILL.md
 | `tasks.py` | Reusable collection manifests, saved input verification, configuration defaults, resource preflight |
 | `storage.py` | Standard-library SQLite checkpoints, transactional application facts/views/evidence references, indexed record pages, isolated crash recovery |
 | `binary.py` | Bounded binary XML, resource string pools, DEX parsing and instruction references |
+| `dex_ir.py` | Bounded DEX operand decoding and exception-region structure |
+| `privacy_models.py` | Versioned exact source/transform signatures and sensitive capability categories |
+| `dataflow.py` | Bounded path states, object/field/collection propagation, modeled calls, network paths and explicit gaps |
 | `manifest.py` | Permission declarations, components, application configurations, unparsed resource references |
 | `endpoints.py` | Endpoint extraction, bounded decoding, normalization, provenance, limited redaction |
 | `rules.py` | Versioned capability mappings, SDK fingerprints, API signals, telemetry events, diagnostic fields |
@@ -47,7 +50,7 @@ The online bootstrap entry clones code and documentation from `https://github.co
 4. Check the versioned cache. On a cache miss, read selected ZIP entries and parse manifests, DEX files, resources, and strings according to the selected mode.
 5. Record endpoints, SDKs, signals, and stage statuses with stable evidence IDs and artifact provenance. Commit every returned artifact, including partial/failed results, to `analysis.sqlite3`, then release worker-owned results. Resume imports only checkpoints compatible with input identity, semantic budgets, mode, and supplemental tool selection.
 6. When `decompile` mode and jadx are specified, run supplemental decompilation sequentially, scanning generated Java/Kotlin text for file and line matches; this supplements base analysis without upgrading to E3/E4 dataflow.
-7. Aggregate by application identity using per-record SQLite merges, attaching permission snapshots, capabilities, findings, and coverage without building a full application evidence tree in memory. Commit compact application views, evidence references, and domain projections in the same transaction as finalized application facts.
+7. Aggregate by application identity using per-record SQLite merges, attaching permission snapshots, capabilities, findings, and coverage. Persist bounded method/field facts even when they match no rule. Analyze methods on demand within one application, including its supplied splits, using bounded E3/E4 models. Commit paths, compact application views, evidence references and domain projections in the same transaction as finalized facts; never link incompatible package/version groups.
 8. Commit finalized report metadata. Generate the compatible JSON export incrementally, and project bounded summaries/Markdown and disk-deduplicated domains. Follow-up queries prefer SQLite facts without re-scanning or whole-report loading.
 
 ## Performance Tradeoffs
@@ -77,9 +80,15 @@ Resource/XML string pools and DEX string, type, prototype, parameter, method, an
 
 DEX method-ID and invocation signal matching reuse the bounded iteration checks. SDK matching checks its budget before completing, and artifact finalization records cancellation even when it skips SDK matching and never writes a cache. Cancellation preserves extracted facts without producing reusable successful checkpoints; memory stops retain their resource flag and partial status. Older checkpoints already missing both SDK results and cancellation stages cannot be distinguished from legitimate results; affected tasks must be reparsed from their saved snapshot with caching disabled, as described in the recovery instructions.
 
-Caches store successful artifact facts only. Partial failures, unreadable files, or cancellations are never cached as successes. Cache writes use atomic file replacement with payload validation and cancellation checks between records. Rule updates require bumping `RULE_VERSION`; parser changes that alter extracted facts require bumping `ENGINE_VERSION`. Output-equivalent performance changes retain compatible successful caches. Known legacy DEX memory-interruption gaps are retried even when their original checkpoint omitted the resource flag.
+Caches store successful artifact facts only. Partial failures, unreadable files, or cancellations are never cached as successes. Cache writes use atomic file replacement with payload validation and cancellation checks between records. Rule updates require bumping `RULE_VERSION`; parser changes that alter extracted facts require bumping `ENGINE_VERSION`; privacy-summary semantics require bumping `MODEL_VERSION` in `privacy_models.py`. Output-equivalent performance changes retain compatible successful caches. Known legacy DEX memory-interruption gaps are retried even when their original checkpoint omitted the resource flag.
 
 Cache reads use bounded byte chunks, and payload checksums check cancellation, time, and RSS budgets during encoding. Admission estimates eight times the cache file size against available host/cgroup and process-budget headroom; a skipped cache remains untouched while its APK is parsed, and that run does not replace the skipped file. This is a conservative estimate, not a hard allocation bound: JSON decoding still occurs as one operation, and concurrent workers share process memory. Cache resource interruptions propagate instead of falling back as ordinary corruption, and write interruptions retain extracted facts. Report exports check cancellation across stages, domain rows, and atomic replacement; the CLI checks again before reporting completion. Committed analysis facts remain usable if export is interrupted. DEX checksum operations use views over the existing byte buffer without copying the full input.
+
+SQLite dataflow lookup caches immutable method definitions within one application analysis, bounded by 64 entries and 4 MiB of conservative retained-object accounting. Roots reuse hits but skip cache admission on misses; call-site lookups populate the cache. Hits retain cancellation, time and RSS checks; oversized methods bypass caching. The signature-index pass still precedes interpretation so later definitions and ambiguous duplicates remain visible. Evidence indexing and JSON evidence queries share the evidence-bearing category list, excluding method/field facts while retaining their own storage and queries. Method parsing attributes body errors only to the active retained method; a later method/class header failure does not invalidate a completed method.
+
+Flow retention deduplicates complete identities before capacity checks and groups category, ordered evidence IDs and endpoint sets independently of conditions. Up to four condition variants retain their existing finding structure. At total capacity, a new group can replace an excess variant while retaining at least one record for each existing group; truncation is partial and located. Review priority counts distinct groups rather than variants, while finding counts and queries retain record semantics. See [Privacy Models and Limits](privacy-analysis.md) for the budgets and residual limits.
+
+Dataflow endpoint validation is shared by URL/OkHttp string assignment, URLConnection resolution and flow emission. It filters unsupported types, malformed absolute URLs and unmodeled schemes while retaining accepted literals verbatim. Expected URL parsing errors become located gaps; cancellation, memory and persistence failures retain their existing propagation. This boundary does not add a broad application-error fallback or prove runtime URL acceptance. Capability derivation aggregates the highest signal evidence level per category in one pass; permission declarations remain E0. Bare version names are excluded from sensitive fingerprint matching while precise framework fields and modeled APIs remain supported.
 
 ## Scope
 
@@ -89,8 +98,8 @@ See [LICENSE](../LICENSE).
 - `priority` provides explainable review ordering; it does not represent breach probability or upload volume.
 - Historical results are accessed through query scripts; no automatic package management or AppOps modification is performed.
 - JSON contract follows `schema_version: 1`; existing output directories are never overwritten.
-- New SQLite storage uses independent `store_version: 2`; reusable snapshots remain version `1`. Current scripts read version 1 databases without mutating them. Resume imports artifact facts into a new version 2 output and rebuilds application views and evidence indexes; it never migrates the source database in place. Version 2 databases require current scripts; schema 1 JSON remains available for existing JSON consumers. Older tasks without a collection manifest still use explicit local APK input and known successful-result caches.
-- E3/E4 dataflow, complete resource evaluation, and cross-run diffing are currently unimplemented.
+- New SQLite storage uses independent `store_version: 3`; snapshots remain version `1` and JSON remains schema `1`. The existing read paths for databases 1/2 remain available; there is no new migration layer. New structure sections and flow evidence use the same transactional record/index machinery. Resume writes a new directory, checks semantic identities and rebuilds application analysis; old facts without structure cannot manufacture paths.
+- E3/E4 are bounded implementations with explicit unknowns. Complete resource evaluation, native semantics, full Android lifecycle modeling and cross-run diffing remain unimplemented. [Privacy models and limits](privacy-analysis.md) define the supported model and resource caps.
 
 ## Verification
 
@@ -108,6 +117,9 @@ Repeatable synthetic performance probes use only the standard library:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 tests/benchmarks/performance.py --output .dev/benchmarks/postprocess.json
 PYTHONDONTWRITEBYTECODE=1 python3 tests/benchmarks/parser.py --output .dev/benchmarks/parser.json
+PYTHONDONTWRITEBYTECODE=1 python3 tests/benchmarks/privacy.py --methods 100 --repeats 5
 ```
 
 Each probe warms up once and defaults to five measured runs. Postprocessing reports phase times, record decodes, file hashes/sizes, and domain scaling; parser probes compare worker counts, successful caches, and checkpoint imports. Linux process RSS and VmHWM are reported separately from Python allocation profiling. OS page-cache state is uncontrolled. Synthetic results do not establish throughput or memory limits for real large APKs; include index construction and disk growth when assessing end-to-end gains.
+
+The privacy probe compares identical synthetic method inputs across source roots with `--source PATH`, measuring parsing, persistence, application analysis, export, path counts and disk growth. New E3/E4 analysis adds work and structure; evaluate its cost alongside coverage rather than requiring byte-identical old/new reports or claiming a speedup.

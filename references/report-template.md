@@ -33,9 +33,13 @@ This report is derived from static artifacts and optional one-time device snapsh
 |---|---|---|---|---|
 {{sdks}}
 
-## Telemetry and Endpoint Findings
+## Privacy Paths, Capabilities and Endpoint Findings
 
-Evidence IDs referenced by findings can be queried using `query_results.py --section evidence --id ID`. All entries here are static candidates and do not prove data was transmitted.
+Retrieve the complete finding with `query_results.py --section findings --id ID`, and each supporting location with `--section evidence --id ID`. Capability candidates do not establish dataflow. E3/E4 paths are modeled static possibilities; inspect conditions, endpoint status and coverage gaps. Neither category proves actual collection, upload or a privacy violation. Zero findings does not establish safety.
+
+For `privacy_capability_candidate`, E0 declaration candidates embed permission evidence as well as `evidence_ids`; E1/E2 signal candidates reference signal evidence through `evidence_ids`. Both forms support the evidence query above.
+
+A path's `resolved_candidate` endpoint status means that at least one retained destination passed the model's checks. It does not guarantee that all destination alternatives were retained. Rejected alternatives appear in the same application's dataflow coverage gaps with `PARTIAL` status; query `--section coverage --package PACKAGE --contains dataflow` and inspect `metrics.gaps` alongside the finding. There is no separate completeness flag on each finding.
 
 | Application | Type | Evidence Level | Finding ID | Evidence ID Sample |
 |---|---|---|---|---|
@@ -52,6 +56,8 @@ Counts reflect the number of matched static locations (strings, method tables, b
 ## Endpoint and Domain Candidates
 
 `url` denotes candidates with explicit protocols, `scheme_relative` has unspecified protocol, `domain` denotes bare domain clues, and `unresolved_template` contains unresolved placeholders. Bare domains may originate from package names, documentation, tests, or samples, and should not be used directly as blocklists.
+
+Literal endpoint extraction and library dataflow models have separate protocol scopes. A `ws`, `wss` or `mqtt` string candidate alone does not imply a modeled sending path; a modeled destination also need not appear in the literal endpoint collection.
 
 | Application | Type | Value | Evidence Level | ID |
 |---|---|---|---|---|

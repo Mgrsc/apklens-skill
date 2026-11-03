@@ -44,7 +44,8 @@ from static_analysis.tasks import (
 LIMITATIONS = [
     "Only supplied or successfully collected APK artifacts are analyzed; inaccessible system services, firmware and dynamically delivered code are outside this result.",
     "Static evidence does not prove that collection or transmission occurred, or that every telemetry implementation was found.",
-    "E0 denotes capability, E1 denotes a static clue, and E2 denotes a direct DEX string reference or invocation. E3 and E4 dataflow are not implemented.",
+    "E0 denotes capability, E1 denotes a static clue, E2 denotes a direct DEX reference, and E3/E4 denote bounded modeled intra/inter-method possible dataflow. Unknown calls, unsupported instructions and exhausted budgets remain coverage gaps.",
+    "Entry reachability, default settings, cloud controls, authorization, actual uploads, capture duration, file retention and automatic reinstallation require separately authorized runtime evidence; this scan does not collect it.",
     "Resource string pools are inspected, but resource references, configuration qualifiers and effective network-security or backup policies are not resolved.",
     "Native analysis is limited to printable strings. Complex reflection, encrypted strings, arbitrary runtime construction and nested compressed assets are not fully resolved.",
     "Bare domains may be package names, documentation or examples. SDK and telemetry classifications are versioned heuristics, not observed network behavior.",

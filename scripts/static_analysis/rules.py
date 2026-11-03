@@ -2,8 +2,9 @@ import re
 
 from .common import stable_id
 from .endpoints import host_matches
+from .privacy_models import PRECISE_CALL_SIGNALS, SENSITIVE_SIGNALS, call_signal
 
-RULE_VERSION = "1"
+RULE_VERSION = "4"
 CAPABILITIES = {
     "location": [
         "ACCESS_FINE_LOCATION",
@@ -19,7 +20,11 @@ CAPABILITIES = {
         "CAPTURE_VOICE_COMMUNICATION_OUTPUT",
     ],
     "camera": ["CAMERA"],
-    "screen": ["FOREGROUND_SERVICE_MEDIA_PROJECTION"],
+    "screen": [
+        "FOREGROUND_SERVICE_MEDIA_PROJECTION",
+        "CAPTURE_VIDEO_OUTPUT",
+        "CAPTURE_SECURE_VIDEO_OUTPUT",
+    ],
     "installed_apps": ["QUERY_ALL_PACKAGES", "PACKAGE_USAGE_STATS"],
     "device_identity": ["READ_PHONE_STATE", "READ_PRIVILEGED_PHONE_STATE"],
     "files": [
@@ -80,7 +85,15 @@ SIGNAL_PATTERNS = {
     "network_api": r"(?:Ljava/net/(?:URL|HttpURLConnection|URLConnection);|Lokhttp3/(?:Request|OkHttpClient|HttpUrl);|Lorg/chromium/net/|HttpURLConnection|OkHttpClient|openConnection)",
     "settings_write": r"(?:Landroid/provider/Settings\$(?:Global|Secure);->put|SystemProperties.*set|Settings\.(?:Global|Secure)\.put)",
     "sms_api": r"(?:SmsManager|sendTextMessage|content://sms)",
-    "device_identifier": r"(?:getDeviceId|getImei|getMeid|getSubscriberId|getSerial|ANDROID_ID|android_id|AdvertisingIdClient|AppSetIdClient|oaid|OpenDeviceIdentifier)",
+    "device_identifier": r"(?:getDeviceId|getImei|getMeid|getSubscriberId|getSimSerialNumber|getIccId|getSerial|ANDROID_ID|android_id|AdvertisingIdClient|AppSetIdClient|oaid|OpenDeviceIdentifier)",
+    "identifier_field": r"(?i)(?:^|[^a-z0-9])(imei|imsi|iccid)(?:$|[^a-z0-9])",
+    "sim_identifier": r"(?:getSimSerialNumber|getIccId)",
+    "usage_stats": r"(?:UsageStats|UsageEvents|queryUsageStats|queryEvents|queryAndAggregateUsageStats)",
+    "network_stats": r"(?:NetworkStats|TrafficStats|queryDetailsForUid|getUidRxBytes|getUidTxBytes)",
+    "audio_capture": r"(?:AudioRecord|MediaRecorder|setAudioSource|startRecording)",
+    "speech_recognition": r"(?:SpeechRecognizer|RecognitionListener|RecognizerIntent)",
+    "application_fingerprint": r"(?:SigningInfo|getApkContentsSigners|getSigningCertificateHistory|GET_SIGNING_CERTIFICATES|signingInfo|Landroid/content/pm/PackageInfo;->(?:versionName:Ljava/lang/String;|versionCode:I)\Z)",
+    "data_encoding": r"(?:Base64|GZIPOutputStream|Deflater|ByteArrayOutputStream)",
     "webview_bridge": r"addJavascriptInterface",
     "accessibility_service": r"AccessibilityService",
     "notification_listener": r"NotificationListenerService",
@@ -98,8 +111,11 @@ SIGNALS = {name: re.compile(pattern) for name, pattern in SIGNAL_PATTERNS.items(
 
 def signal_matches(value, source, level="E1"):
     findings = []
+    precise = call_signal(value) if level == "E2" else None
     for name, pattern in SIGNALS.items():
-        if pattern.search(value):
+        if pattern.search(value) or name == precise:
+            if level == "E2" and name in PRECISE_CALL_SIGNALS and name != precise:
+                continue
             evidence = {**source, "excerpt": value[:2048]}
             evidence["id"] = stable_id("signal_evidence", name, source, value)
             findings.append(
@@ -197,14 +213,16 @@ def capabilities(permissions, signals):
                     "meaning": "Declared access capability; actual use is unproven",
                 }
             )
-    for name in sorted(
-        {item["type"] for item in signals}
-        & {"device_identifier", "clipboard_api", "sensor_api", "installed_apps_api"}
-    ):
+    levels = {}
+    for signal in signals:
+        name = signal["type"]
+        if name in SENSITIVE_SIGNALS or name == "sensor_api":
+            levels[name] = max(levels.get(name, "E0"), signal["evidence_level"])
+    for name, level in sorted(levels.items()):
         results.append(
             {
                 "type": name,
-                "evidence_level": "E1",
+                "evidence_level": level,
                 "meaning": "Static API or string evidence; availability and actual use are unproven",
             }
         )

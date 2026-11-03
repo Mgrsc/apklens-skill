@@ -125,7 +125,7 @@ python3 scripts/analyze.py scan \
   --output .dev/analysis/decompile-001
 ```
 
-This mode runs base static analysis first, then invokes jadx to decompile code and scan Java/Kotlin text line-by-line for endpoints and rule signals, merging file paths, line numbers, and findings into the report. It does not perform cross-method dataflow analysis or prove data transmission.
+This mode runs base static analysis, including bounded DEX E3/E4 models, then invokes jadx to decompile code and scan Java/Kotlin text line-by-line for endpoints and rule signals. Supplemental text contributes file/line clues, not E3/E4 evidence or proof of transmission. See [privacy models and limits](privacy-analysis.md).
 
 If `--jadx` is omitted, base static analysis executes and the supplemental decompilation stage is marked `UNAVAILABLE`. Supplemental decompilation runs sequentially to avoid high concurrent memory usage; base artifact parsing uses a bounded worker pool. Decompiled text and rule findings are not cached.
 
@@ -145,15 +145,21 @@ python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
 
 python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
   --section evidence --id EVIDENCE_ID
+
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
+  --section findings --id FINDING_ID
+
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
+  --section methods --package com.example.app --limit 50
 ```
 
-Available sections: `summary`, `apps`, `permissions`, `capabilities`, `endpoints`, `sdks`, `signals`, `findings`, `coverage`, and `evidence`. `summary` provides an unfilterable run overview; other sections support pagination, `--package`, `--id`, and `--contains`.
+Available sections: `summary`, `apps`, `permissions`, `capabilities`, `endpoints`, `sdks`, `signals`, `findings`, `methods`, `fields`, `coverage`, and `evidence`. `summary` provides an unfilterable run overview; other sections support pagination, `--package`, `--id`, and `--contains`. A finding's `evidence_ids` identify its supporting locations. Summary fields disclose important review totals and how many applications are outside the 20-app display cap; paginate to inspect all targets.
 
 Pagination limits range from 1 to 500; inspect `total` to determine subsequent pages. URL query parameters, fragments, and credentials are redacted by default; `--include-sensitive` is reserved for authorized local inspection of original values.
 
 New SQLite databases apply exact IDs, counts, and pagination to indexed facts; evidence IDs use persisted references instead of rescanning every endpoint and signal. Summaries use committed lightweight application views, and Markdown stops reading display collections at the requested row limits. Substring filters preserve Unicode casefold behavior and can still scan candidates; known package scopes and exact IDs narrow that work. Deep offsets and exact counts can still traverse indexes. Legacy `analysis.json` remains accepted, but is loaded as a whole and rejected above 256 MiB; use the explicit `analysis.sqlite3` path for large reports. A database is authoritative only for its own task; the query command does not silently substitute a neighboring database for a requested JSON file.
 
-New tasks write `store_version: 2`, including compact views and evidence references committed with application facts. Current scripts also read version 1 databases through compatible, potentially slower paths. Resume builds version 2 in a new output directory without modifying the source; there is no in-place migration. Older scripts cannot read version 2 databases; the schema 1 JSON export remains compatible. Evidence references add disk space but do not duplicate evidence bodies.
+New tasks write `store_version: 3`, including bounded method/field structure and path findings with compact views and evidence references committed alongside application facts. The existing version 1/2 readers remain, without a new migration framework. Resume writes version 3 in a new directory, checks engine/rule/model identities and rebuilds application analysis without modifying the source. Older programs do not read version 3 databases; JSON retains schema 1 and existing field meanings. Evidence references add disk space but do not duplicate evidence bodies.
 
 ## Re-exporting Reports
 
@@ -170,7 +176,7 @@ Exports summary JSON, Markdown, all domain candidates, and telemetry domain cand
 | File | Meaning |
 |---|---|
 | `analysis.json` | Versioned machine-readable results including facts, evidence, coverage, and input paths; may contain sensitive original values |
-| `analysis.sqlite3` | Durable artifact checkpoints, finalized facts, and query projections; preferred input for large queries and re-exports, with independent `store_version: 2` |
+| `analysis.sqlite3` | Durable artifact checkpoints, finalized facts, and query projections; preferred input for large queries and re-exports, with independent `store_version: 3` |
 | `snapshot.json` | Reusable collection manifest, analysis configuration, artifact identities/paths, and available device state; may contain sensitive values |
 | `progress.json` | Last task milestone; inspect database checkpoints and coverage for authoritative completion |
 | `summary.json` | Redacted summary with an overview of up to 20 applications |
@@ -215,8 +221,8 @@ Resource/XML string pools and DEX tables check cancellation, timeout, and RSS du
 
 The number of retained completed artifacts no longer determines the parser's live working set: worker results are committed to SQLite and released. Application merging, evidence deduplication, domain projection, and the JSON export stream records from disk, including for a large single application. This increases disk use: allow space for both SQLite facts and the compatible JSON export, plus retained APKs and any recovery copy. Do not use a fixed application count as a memory guarantee or disable resource protection when expanding coverage.
 
-The cache defaults to a sibling `cache/` directory relative to the output directory. Cache keys incorporate input SHA-256, engine and rule versions, mode, and budgets. Duplicated content within a run is parsed only once. Failed, partial, or unreadable runs are not cached as successes; corrupt caches are discarded and recalculated. `--no-cache` disables analysis caching without skipping input snapshotting.
+The cache defaults to a sibling `cache/` directory relative to the output directory. Cache keys incorporate input SHA-256, engine, rule and privacy-model versions, mode, and budgets. Duplicated content within a run is parsed only once. Failed, partial, or unreadable runs are not cached as successes; corrupt caches are discarded and recalculated. `--no-cache` disables analysis caching without skipping input snapshotting.
 
-Cache entries and task checkpoints have different lifetimes: partial results still receive a transactional checkpoint even when ineligible for the successful-result cache. Existing cache checksums and semantic cache keys remain compatible. Caches continue to load one artifact at a time with a 256 MiB JSON limit; an oversized or invalid cache is ignored and reparsed, rather than treated as completed evidence.
+Cache entries and task checkpoints have different lifetimes: partial results still receive a transactional checkpoint even when ineligible for the successful-result cache. The checksum format remains unchanged; engine/rule/model identity changes invalidate prior analysis caches and checkpoints. Caches continue to load one artifact at a time with a 256 MiB JSON limit; an oversized or invalid cache is ignored and reparsed, rather than treated as completed evidence.
 
 Integrity verification requires reading APK bytes. Input snapshots are captured per run to ensure subsequent evidence references the exact bytes analyzed.

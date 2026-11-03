@@ -352,7 +352,17 @@ def instruction_width(units, position):
     raise AnalysisError(f"Unsupported DEX opcode: 0x{opcode:02x}")
 
 
-def dex_index(data, limits, budget, inspect_code=True):
+def dex_index(data, limits, budget, inspect_code=True, structure_budget=None):
+    from .dex_ir import (
+        MAX_ARTIFACT_UNITS,
+        MAX_INDEXED_METHODS,
+        MAX_METHOD_UNITS,
+        decode_instruction,
+        exception_regions,
+    )
+
+    if structure_budget is None:
+        structure_budget = {"methods": 0, "units": 0}
     reader = BinaryReader(data)
     reader.require(0, 112)
     if data[:4] != b"dex\n" or data[4:7] not in SUPPORTED_DEX_VERSIONS or data[7] != 0:
@@ -441,6 +451,17 @@ def dex_index(data, limits, budget, inspect_code=True):
                 for item in checked_range(length, budget)
             ]
         prototypes.append("(" + "".join(args) + ")" + return_type)
+    count, offset = table(80, 8)
+    fields = []
+    for index in checked_range(count, budget):
+        position = offset + index * 8
+        fields.append(
+            type_at(reader.u16(position))
+            + "->"
+            + string_at(reader.u32(position + 4))
+            + ":"
+            + type_at(reader.u16(position + 2))
+        )
     count, offset = table(88, 8)
     methods = []
     for index in checked_range(count, budget):
@@ -460,12 +481,15 @@ def dex_index(data, limits, budget, inspect_code=True):
     gaps = []
     scanned_methods = 0
     reference_count = 0
+    bodies = []
+    structure_gaps = []
     if inspect_code:
         for class_index in range(count):
             budget.check()
             class_data = reader.u32(offset + class_index * 32 + 24)
             if not class_data:
                 continue
+            current_body = None
             try:
                 counts = []
                 position = class_data
@@ -480,18 +504,61 @@ def dex_index(data, limits, budget, inspect_code=True):
                 for method_count in counts[2:]:
                     method_index = 0
                     for _ in checked_range(method_count, budget):
+                        current_body = None
                         delta, position = reader.uleb(position)
                         method_index += delta
-                        _, position = reader.uleb(position)
+                        access, position = reader.uleb(position)
                         code_offset, position = reader.uleb(position)
                         if method_index >= len(methods):
                             raise AnalysisError(
                                 "DEX method index is outside the method table"
                             )
+                        body = {
+                            "signature": methods[method_index],
+                            "access": access,
+                            "instructions": [],
+                            "handlers": [],
+                        }
+                        if structure_budget["methods"] < min(
+                            MAX_INDEXED_METHODS, limits.max_results
+                        ):
+                            bodies.append(body)
+                            structure_budget["methods"] += 1
+                        else:
+                            structure_gaps.append("DEX method index budget exceeded")
+                            body = None
+                        current_body = body
                         if not code_offset:
+                            if body is not None:
+                                body.update(registers=0, parameters=0)
+                            current_body = None
                             continue
                         reader.require(code_offset, 16)
                         unit_count = reader.u32(code_offset + 12)
+                        if body is not None:
+                            body.update(
+                                registers=reader.u16(code_offset),
+                                parameters=reader.u16(code_offset + 2),
+                                code_offset=code_offset,
+                            )
+                            if unit_count > MAX_METHOD_UNITS or structure_budget[
+                                "units"
+                            ] + unit_count > min(
+                                MAX_ARTIFACT_UNITS, limits.max_references
+                            ):
+                                body["gap"] = "DEX instruction index budget exceeded"
+                                structure_gaps.append(body["gap"])
+                            else:
+                                structure_budget["units"] += unit_count
+                                try:
+                                    body["handlers"] = exception_regions(
+                                        reader, code_offset, unit_count, types, budget
+                                    )
+                                except (Cancelled, MemoryBudgetExceeded):
+                                    raise
+                                except AnalysisError as error:
+                                    body["gap"] = str(error)
+                                    structure_gaps.append(str(error))
                         reader.require(code_offset + 16, unit_count * 2)
                         units = memoryview(data)[
                             code_offset + 16 : code_offset + 16 + unit_count * 2
@@ -510,6 +577,18 @@ def dex_index(data, limits, budget, inspect_code=True):
                             if cursor + width > unit_count:
                                 raise AnalysisError("Truncated DEX instruction")
                             opcode = units[cursor] & 255
+                            if body is not None and not body.get("gap"):
+                                body["instructions"].append(
+                                    decode_instruction(
+                                        units,
+                                        cursor,
+                                        width,
+                                        strings,
+                                        types,
+                                        fields,
+                                        methods,
+                                    )
+                                )
                             location = {
                                 "method": methods[method_index],
                                 "instruction_offset": cursor,
@@ -546,10 +625,13 @@ def dex_index(data, limits, budget, inspect_code=True):
                                 )
                             cursor += width
                         scanned_methods += 1
+                        current_body = None
             except (Cancelled, MemoryBudgetExceeded):
                 raise
             except AnalysisError as error:
                 gaps.append(str(error))
+                if current_body is not None:
+                    current_body["gap"] = str(error)
                 if isinstance(error, BudgetExceeded):
                     break
     return {
@@ -560,6 +642,9 @@ def dex_index(data, limits, budget, inspect_code=True):
         "calls": calls,
         "scanned_methods": scanned_methods,
         "gaps": sorted(set(gaps)),
+        "fields": fields,
+        "bodies": bodies,
+        "structure_gaps": sorted(set(structure_gaps)),
     }
 
 

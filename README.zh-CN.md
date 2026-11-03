@@ -11,7 +11,8 @@
 - **全方位静态解构**：支持单个或多个 Split APK，高保真提取 DEX 引用、资源字符串池、Manifest 权限、导出组件与候选端点。
 - **设备快照采集**：支持通过 ADB 连接已授权实体设备，一键完成已安装应用的元数据与 APK 静态采集。
 - **批量持久化与恢复**：使用标准库 SQLite 逐制品保存检查点，从磁盘合并和导出，支持在新目录恢复中断任务。采集快照可离线复用，无需再次复制 APK。
-- **严守事实边界**：明确划分 E0–E2 静态证据等级，严禁大模型在隐私与遥测分析中臆测虚构数据流。
+- **有界隐私数据流**：跟踪已建模的敏感来源，经载荷构造、编码/加密、可解析方法和部分回调到达网络出口；未知调用与资源上限保留为覆盖缺口。
+- **严守事实边界**：区分 E0–E2 线索与 E3/E4 静态可能路径，不将其当作已观察到上传或已确认的隐私违规。
 
 ## 快速上手
 
@@ -43,12 +44,16 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 
 - `report.md`：结构清晰的 Markdown 综合审计分析报告。
 - `summary.json`：针对 AI 上下文优化的轻量高优先摘要。
-- `analysis.json`：包含所有 E0–E2 静态证据与调用关系的机器可读全量事实。
+- `analysis.json`：包含 E0–E4 发现项和有界方法/字段结构的机器可读证据导出。
 - `analysis.sqlite3`：持久检查点与最终事实，大任务查询和重新导出的首选输入。
 - `snapshot.json` / `progress.json`：可复用的采集状态与最新执行阶段。
 - `domains.txt` / `telemetry-domains.txt`：归一化的网络端点与第三方遥测域名候选。
 
-大任务优先查询 `analysis.sqlite3`，避免整体读取 JSON 导出。新数据库为 ID、分页和证据引用建立索引，轻量视图避免摘要与限行报告反复全量扫描。当前脚本读取数据库版本 1 和 2，新任务写入版本 2，JSON 继续保持 schema 1。可用 `python3 scripts/analyze.py scan --resume previous_task_dir --output new_task_dir` 恢复任务；请保留原任务目录及其引用的 APK。恢复时在新目录重建派生索引。仅采集、离线快照、内存预算及无清单旧任务的恢复方式详见使用参考。
+大任务优先查询 `analysis.sqlite3`，避免整体读取 JSON 导出。数据库为 ID、分页和证据引用建立索引，轻量视图避免摘要全量扫描。新任务写入数据库版本 3，JSON 继续保持 schema 1；沿用版本 1/2 的读取路径。可用 `python3 scripts/analyze.py scan --resume previous_task_dir --output new_task_dir` 恢复任务；请保留原任务目录及其引用的 APK。恢复时在新目录重建应用分析与索引。仅采集、离线快照及内存预算详见使用参考。
+
+摘要中的 `review_required_total` 统计具有声明能力或敏感线索、需要审查的应用，不是已证实的隐私问题或传输路径数。审查排序按独立证据路径和地址分组计数，条件变体不重复加分；发现项计数仍表示实际保留记录数。每组最多保留 4 个条件变体，截断会标为 PARTIAL。方法/字段事实保留量与解释范围上限分别计算，具体预算及 E3/E4 共享覆盖指标见[隐私模型与限制](references/privacy-analysis.md)。
+
+畸形或不受支持的 URL 常量会产生带位置的数据流缺口，分析继续进行。普通应用自有的版本字段本身不触发敏感指纹审查。信号派生的能力保留同类别最高证据等级，权限声明仍为 E0。
 
 ## 详细文档指引
 
@@ -56,6 +61,7 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 - [联网引导 Skill](online-static-analysis/SKILL.md)：单文件远程引导、检出复用与移交规则。
 - [使用与参数参考](references/usage.md)：完整 CLI 参数、高级过滤、配置项与查询用法。
 - [证据与覆盖定义](references/evidence-and-coverage.md)：E0–E4 证据等级、解码与阶段状态。
+- [隐私模型与限制](references/privacy-analysis.md)：支持的来源、传播、异步交接、查询示例及明确停止边界。
 - [实现与架构说明](references/implementation.md)：模块权责归属、流水线设计与性能考量。
 
 ## 开发验证

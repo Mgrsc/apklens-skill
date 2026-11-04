@@ -1,10 +1,11 @@
 ---
 name: online-static-analysis
 description: Online bootstrap entry for acquiring or reusing a local Android static analysis project when a user provides a Skill link or a single SKILL.md file, then invoking the main Skill to inspect permissions, telemetry clues, SDKs, URLs, and coverage gaps on authorized APKs or device snapshots. Requires no prior installation; analysis data always remains local.
-compatibility: Requires a local shell and filesystem, Git, Python 3.10+, and network access for first acquisition or an explicitly requested update. ADB and jadx are optional.
 ---
 
 # Online Static Analysis Entry
+
+Requires a local shell and filesystem, Git, Python 3.10+, and network access for first acquisition or an explicitly requested update. ADB and jadx are optional.
 
 Users can provide the [GitHub link of this file](https://github.com/Mgrsc/apklens-skill/blob/main/online-static-analysis/SKILL.md) directly to an AI without downloading files or installing anything into a global skills directory. Upon receiving the link, fetch and read this file completely; if the web view does not display the full content, read the [raw Markdown](https://raw.githubusercontent.com/Mgrsc/apklens-skill/main/online-static-analysis/SKILL.md). If reading fails, explain the cause rather than guessing operations from the filename.
 
@@ -19,7 +20,7 @@ This bootstrap entry only prepares the complete local project checkout and hands
 1. Confirm workspace access, command execution, and filesystem permissions, as well as Git and Python 3.10+. Clarify the workspace path if ambiguous; if tools or permissions are unavailable, state the missing prerequisites without claiming analysis completion.
 2. Check `.dev/online-static-analysis.md` in the workspace for recorded repository URL, commit SHA, and absolute project path (if present). Reuse a local checkout only if its remote URL matches the repository above, its commit matches the recorded SHA, the directory is intact, and there are no local modifications; verify using local Git without automatic network updates.
 3. If no reusable checkout exists, acquire the project into a new, non-existent directory under `.dev/skill-sources/` in the workspace. Verify or add `.dev/` to the workspace `.gitignore`; do not overwrite existing directories or install into a global skills directory.
-4. After acquisition, verify the Git remote, commit SHA, working tree cleanliness, and the following entrypoints: `SKILL.md`, `scripts/analyze.py`, `scripts/query_results.py`, `scripts/export_report.py`, `scripts/static_analysis/`, and `references/`. The main Skill, reference documents, and scripts must come from this identical commit.
+4. After acquisition, verify the Git remote, commit SHA, working tree cleanliness, and the following entrypoints: `SKILL.md`, `scripts/analyze.py`, `scripts/query_results.py`, `scripts/export_report.py`, `scripts/assess_results.py`, `scripts/static_analysis/`, and `references/`. The main Skill, reference documents, and scripts must come from this identical commit. An intentionally selected older revision without an assessment entrypoint retains its documented capability limits; do not borrow newer documentation or claim validation was performed.
 5. Record the remote URL, full commit SHA, and absolute local project path in `.dev/online-static-analysis.md`. When updating, append a new record identifying the active checkout while preserving previous records and directories. Commit records ensure reproducibility but do not replace cryptographic signature verification.
 
 The commands below illustrate first acquisition. Replace the placeholders with the confirmed workspace path and a new target directory; stop if the directory already exists rather than deleting and retrying:

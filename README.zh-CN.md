@@ -50,7 +50,9 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 - `snapshot.json` / `progress.json`：可复用的采集状态与最新执行阶段。
 - `domains.txt` / `telemetry-domains.txt`：归一化的网络端点与第三方遥测域名候选。
 
-通过 Skill 执行分析时，AI 还会生成 `user-advice.md`，给出逐应用处置建议。脚本生成的 `report.md` 包含事实和核查提示；直接运行 CLI 不生成个性化处置评估。使用 `--section apps --package PACKAGE` 可查询已有安装上下文和有界建议证据样本，轻量摘要有意省略这些上下文。建议不代表已授权修改设备，审查分数高也不表示应用可以安全停用。
+通过 Skill 执行分析时，AI 先准备覆盖全部应用组的 `assessment.json`，核查证据并记录逐应用决策，再校验并生成独立的 `user-advice.md`。[评估契约](references/assessment.md) 定义命令与评估状态。校验 PASS 不等于每个应用都已审查，待核查、延期和只有元数据的目标始终明确展示。脚本生成的 `report.md` 包含事实和核查提示。使用 `--section apps --package PACKAGE` 可查询已有安装上下文和有界建议证据样本。建议不代表已授权修改设备，审查分数高也不表示应用可以安全停用。
+
+使用 `summary.facts` 读取应用层端点候选、SDK 匹配记录／名称／涉及应用数、权限来源及各自的输入与解析分母，不要叠加制品层和应用层统计。摘要与 Markdown 上限仅限制展示，使用 `has_more`／`next_offset` 分页检查全部目标。系统标记不能证明出厂预装或用户主动安装。两阶段方法保留与根级额度让晚位敏感区域获得分析机会，同时披露未保留方法体、未启动根和模型缺口。
 
 大任务优先查询 `analysis.sqlite3`，避免整体读取 JSON 导出。数据库为 ID、分页和证据引用建立索引，轻量视图避免摘要全量扫描。新任务写入数据库版本 3，JSON 继续保持 schema 1；沿用版本 1/2 的读取路径。可用 `python3 scripts/analyze.py scan --resume previous_task_dir --output new_task_dir` 恢复任务；请保留原任务目录及其引用的 APK。恢复时在新目录重建应用分析与索引。仅采集、离线快照及内存预算详见使用参考。
 

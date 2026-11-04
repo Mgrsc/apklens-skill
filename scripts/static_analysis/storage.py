@@ -15,9 +15,9 @@ from .common import (
     Cancelled,
     JsonRecords,
     MemoryBudgetExceeded,
-    aggregate_status,
     check_resources,
 )
+from .facts import application_facts, artifact_state
 
 STORE_VERSION = 3
 INDEXED_STORE_VERSION = 2
@@ -77,6 +77,7 @@ def application_view(app, signal_stats=None, sdk_names=None):
             for status, count in coverage_counts.items()
             if status not in COMPLETE_COVERAGE_STATUSES
         ),
+        "facts": application_facts(app, signal_stats),
     }
 
 
@@ -136,12 +137,7 @@ def checkpoint_source(path, output):
 
 
 def artifact_status(result):
-    states = {item["status"] for item in result["stages"]}
-    if "CANCELLED" in states:
-        return "CANCELLED"
-    if "FAILED" in states:
-        return "FAILED"
-    return aggregate_status({"status": status} for status in states)
+    return artifact_state({item["status"] for item in result["stages"]})
 
 
 class Records(JsonRecords):

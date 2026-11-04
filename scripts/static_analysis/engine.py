@@ -13,6 +13,7 @@ from pathlib import Path
 from . import ENGINE_VERSION, SCHEMA_VERSION
 from .binary import (
     checked_range,
+    decode_method_bodies,
     dex_index,
     printable_strings,
     resource_strings,
@@ -39,6 +40,7 @@ from .common import (
 from .dataflow import MODEL_VERSION, analyze_dataflow, evidence_path_key
 from .endpoints import EndpointCollector, host_matches
 from .manifest import analyze_manifest
+from .method_selection import MethodSelection
 from .privacy_models import SENSITIVE_SIGNALS
 from .rules import (
     RULE_VERSION,
@@ -122,8 +124,10 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     started = time.monotonic()
     budget = Budget(limits, cancel)
     identity = artifact["sha256"]
-    key = cache_key(identity, limits, mode)
-    cache_file = Path(cache_directory) / f"{key}.json" if cache_directory else None
+    analysis_key = cache_key(identity, limits, mode)
+    cache_file = (
+        Path(cache_directory) / f"{analysis_key}.json" if cache_directory else None
+    )
     cache_issue = None
     if cache_file and cache_file.exists():
         try:
@@ -132,9 +136,12 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                 cache_issue = "Cache read was skipped to preserve memory headroom"
                 cache_file = None
             else:
-                if result.get("sha256") != identity or result.get("cache_key") != key:
+                if (
+                    result.get("sha256") != identity
+                    or result.get("cache_key") != analysis_key
+                ):
                     raise AnalysisError("Cached identity does not match the artifact")
-                result["cache"] = {"hit": True, "key": key}
+                result["cache"] = {"hit": True, "key": analysis_key}
                 result["elapsed_seconds"] = round(time.monotonic() - started, 3)
                 budget.check()
                 return result
@@ -146,7 +153,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     result = {
         "sha256": identity,
         "size": artifact["size"],
-        "cache_key": key,
+        "cache_key": analysis_key,
         "manifest": None,
         "endpoints": [],
         "signals": [],
@@ -154,6 +161,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
         "methods": [],
         "fields": [],
         "stages": [],
+        "definition_summary": {"identities": "", "duplicates": [], "complete": False},
         "statistics": {
             "entries": 0,
             "bytes_read": 0,
@@ -164,7 +172,10 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     }
     stages = result["stages"]
     descriptors = []
-    structure_budget = {"methods": 0, "units": 0}
+    selection = MethodSelection(limits, budget)
+    dex_entries = {}
+    structure_stages = {}
+    definition_inventory_complete = mode != "quick"
     total_read = 0
     signal_ids = set()
     signals_truncated = False
@@ -272,6 +283,8 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                     )
                     continue
                 if entry.flag_bits & 1:
+                    if kind == "dex":
+                        definition_inventory_complete = False
                     stages.append(
                         stage(kind, "UNAVAILABLE", name, "Encrypted archive member")
                     )
@@ -280,6 +293,8 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                     entry.file_size > limits.max_entry_bytes
                     or total_read + entry.file_size > limits.max_total_bytes
                 ):
+                    if kind == "dex":
+                        definition_inventory_complete = False
                     stages.append(
                         stage(kind, "PARTIAL", name, "Archive byte budget exceeded")
                     )
@@ -319,15 +334,18 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                                     )
                     elif kind == "dex":
                         result["statistics"]["dex_files"] += 1
+                        previous_definitions = selection.considered
                         try:
                             index = dex_index(
                                 data,
                                 limits,
                                 budget,
                                 inspect_code=mode != "quick",
-                                structure_budget=structure_budget,
+                                selection=selection if mode != "quick" else None,
+                                entry=name,
                             )
                         except (AnalysisError, UnicodeError) as error:
+                            definition_inventory_complete = False
                             if isinstance(error, (Cancelled, MemoryBudgetExceeded)):
                                 raise
                             for item in printable_strings(data):
@@ -344,26 +362,18 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             )
                             continue
                         result["statistics"]["dex_strings"] += len(index["strings"])
+                        if mode != "quick":
+                            definition_inventory_complete &= index[
+                                "definition_inventory_complete"
+                            ]
+                            dex_entries[name] = (
+                                entry,
+                                hashlib.sha256(data).hexdigest(),
+                            )
                         result["statistics"]["scanned_methods"] += index[
                             "scanned_methods"
                         ]
                         descriptors.append((name, index["types"]))
-                        for body in index["bodies"]:
-                            budget.check()
-                            result["methods"].append(
-                                {
-                                    "id": stable_id(
-                                        "method",
-                                        identity,
-                                        name,
-                                        body["signature"],
-                                        body.get("code_offset"),
-                                    ),
-                                    "artifact": identity,
-                                    "entry": name,
-                                    **body,
-                                }
-                            )
                         fields_truncated = False
                         for field_index, field in enumerate(index["fields"]):
                             if field_index % 256 == 0:
@@ -393,23 +403,27 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             index["structure_gaps"].append(
                                 "DEX field index budget exceeded"
                             )
-                        stages.append(
-                            stage(
-                                "dex_structure_index",
-                                "DEFERRED"
-                                if mode == "quick"
-                                else "PARTIAL"
-                                if index["structure_gaps"] or index["gaps"]
-                                else "COMPLETE",
-                                name,
-                                "Quick mode excludes method bodies"
-                                if mode == "quick"
-                                else "; ".join(index["structure_gaps"] + index["gaps"])
-                                or None,
-                                methods=len(index["bodies"]),
-                                fields=len(index["fields"]),
-                            )
+                        structure_stages[name] = stage(
+                            "dex_structure_index",
+                            "DEFERRED"
+                            if mode == "quick"
+                            else "PARTIAL"
+                            if index["structure_gaps"] or index["gaps"]
+                            else "COMPLETE",
+                            name,
+                            "Quick mode excludes method bodies"
+                            if mode == "quick"
+                            else "; ".join(index["structure_gaps"] + index["gaps"])
+                            or None,
+                            methods=None if mode == "quick" else 0,
+                            method_definitions=selection.considered
+                            - previous_definitions
+                            if mode != "quick"
+                            else None,
+                            method_references=len(index["methods"]),
+                            fields=len(index["fields"]),
                         )
+                        stages.append(structure_stages[name])
                         for item in index["strings"]:
                             consume(
                                 item["value"],
@@ -451,7 +465,10 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                                 "Quick mode excludes instruction references"
                                 if mode == "quick"
                                 else "; ".join(index["gaps"]) or None,
-                                methods=index["scanned_methods"],
+                                methods=index["scanned_methods"]
+                                if mode != "quick"
+                                else None,
+                                scan_complete=index["reference_scan_complete"],
                             )
                         )
                     elif kind == "resources":
@@ -552,6 +569,8 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             elapsed_seconds=round(time.monotonic() - item_started, 4),
                         )
                     )
+                    data = None
+                    index = None
                 except (Cancelled, MemoryBudgetExceeded):
                     raise
                 except (
@@ -565,6 +584,8 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                     ET.ParseError,
                     struct.error,
                 ) as error:
+                    if kind == "dex":
+                        definition_inventory_complete = False
                     stages.append(
                         stage(
                             kind,
@@ -575,11 +596,104 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             str(error),
                         )
                     )
+            result["statistics"]["unique_bytes_read"] = total_read
+            if mode != "quick":
+                selected, selection_metrics = selection.select()
+                second_pass_bytes = 0
+                for name in sorted({method["entry"] for method in selected}):
+                    budget.check()
+                    entry, digest = dex_entries[name]
+                    if total_read + entry.file_size > limits.max_total_bytes:
+                        stages.append(
+                            stage(
+                                "dex_bodies",
+                                "PARTIAL",
+                                name,
+                                "Archive byte budget exceeded during method-body decoding",
+                            )
+                        )
+                        continue
+                    with archive.open(entry) as handle:
+                        data = handle.read(limits.max_entry_bytes + 1)
+                    total_read += len(data)
+                    second_pass_bytes += len(data)
+                    result["statistics"]["bytes_read"] = total_read
+                    budget.check()
+                    if (
+                        len(data) > limits.max_entry_bytes
+                        or hashlib.sha256(data).hexdigest() != digest
+                    ):
+                        raise AnalysisError(
+                            "DEX contents changed between discovery and body decoding"
+                        )
+                    index = dex_index(data, limits, budget, inspect_code=False)
+                    bodies = decode_method_bodies(
+                        data,
+                        index,
+                        [method for method in selected if method["entry"] == name],
+                        budget,
+                    )
+                    for body in bodies:
+                        result["methods"].append(
+                            {
+                                "id": stable_id(
+                                    "method",
+                                    identity,
+                                    name,
+                                    body["signature"],
+                                    body.get("code_offset"),
+                                ),
+                                "artifact": identity,
+                                **body,
+                            }
+                        )
+                    structure_stages[name]["metrics"]["methods"] = len(bodies)
+                    data = None
+                    index = None
+                selection_metrics.update(
+                    definition_inventory_complete=definition_inventory_complete,
+                    retained_methods=len(result["methods"]),
+                    retained_instruction_methods=sum(
+                        bool(method["instructions"]) and not method.get("gap")
+                        for method in result["methods"]
+                    ),
+                    second_pass_bytes=second_pass_bytes,
+                )
+                incomplete = (
+                    any(
+                        selection_metrics[key]
+                        for key in (
+                            "candidate_pool_omitted",
+                            "body_budget_omitted",
+                            "neighbor_truncations",
+                            "neighbor_edges_omitted",
+                        )
+                    )
+                    or not definition_inventory_complete
+                    or len(result["methods"]) != len(selected)
+                    or any(method.get("gap") for method in result["methods"])
+                )
+                stages.append(
+                    stage(
+                        "dex_body_selection",
+                        "PARTIAL" if incomplete else "COMPLETE",
+                        identity,
+                        "DEX instruction or method index budget, discovery boundary or decoding gap; omitted methods remain unknown"
+                        if incomplete
+                        else None,
+                        **selection_metrics,
+                    )
+                )
+                result["definition_summary"] = selection.definitions.summary(
+                    definition_inventory_complete
+                )
     except MemoryBudgetExceeded as error:
+        definition_inventory_complete = False
         result["resource_limited"] = True
         cancel.set()
         stages.append(stage("artifact_analysis", "PARTIAL", identity, str(error)))
     except Cancelled as error:
+        definition_inventory_complete = False
         stages.append(stage("artifact_analysis", "CANCELLED", identity, str(error)))
     except (
         AnalysisError,
@@ -589,6 +703,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
         zipfile.BadZipFile,
         RuntimeError,
     ) as error:
+        definition_inventory_complete = False
         stages.append(
             stage(
                 "artifact_analysis",
@@ -661,9 +776,37 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                 "Analysis cancelled before artifact completion",
             )
         )
+    stages.append(
+        stage(
+            "dex_definition_inventory",
+            "DEFERRED"
+            if mode == "quick"
+            else "COMPLETE"
+            if result["definition_summary"]["complete"]
+            else "PARTIAL",
+            identity,
+            "Quick mode excludes definition discovery"
+            if mode == "quick"
+            else None
+            if result["definition_summary"]["complete"]
+            else "Definition inventory is incomplete; unique application implementations cannot be established",
+            definitions=selection.considered if mode != "quick" else None,
+            unique_identities=len(selection.definitions.counts)
+            if mode != "quick"
+            else None,
+            duplicate_identities=sum(
+                count > 1 for count in selection.definitions.counts.values()
+            )
+            if mode != "quick"
+            else None,
+            complete=result["definition_summary"]["complete"]
+            if mode != "quick"
+            else None,
+        )
+    )
     for item in stages:
         item["artifact"] = identity
-    result["cache"] = {"hit": False, "key": key}
+    result["cache"] = {"hit": False, "key": analysis_key}
     if cache_issue:
         result["cache"]["notice"] = cache_issue
     result["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -1175,7 +1318,12 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
             )
         else:
             flows, coverage = analyze_dataflow(
-                app["methods"], limits, store.cancel if store else None
+                app["methods"],
+                limits,
+                store.cancel if store else None,
+                definition_summaries=(
+                    results[item["sha256"]] for item in group["artifacts"]
+                ),
             )
             app["findings"].extend(flows)
             app["coverage"].extend(coverage)

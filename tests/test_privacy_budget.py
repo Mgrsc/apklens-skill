@@ -271,7 +271,7 @@ class PrivacyBudgetTests(unittest.TestCase):
                 helper = ("Lsample/A;" if helper_first else "Lsample/Z;") + "->help()V"
                 caller_owner = "Lsample/Z;" if helper_first else "Lsample/A;"
                 definitions = [
-                    {"signature": helper, "code": [0x0E]},
+                    {"signature": helper, "code": [0] * 6 + [0x0E]},
                     {
                         "signature": caller_owner + "->call()V",
                         "code": [
@@ -295,6 +295,10 @@ class PrivacyBudgetTests(unittest.TestCase):
                     if item["signature"] == helper
                 )
                 self.assertEqual(cache.call_count, 1)
+                self.assertEqual(
+                    next(iter(analyzer.index)),
+                    helper if helper_first else caller_owner + "->call()V",
+                )
                 self.assertEqual(records.reads[identity], 2 if helper_first else 1)
                 self.assertEqual(coverage[0]["status"], "COMPLETE")
 
@@ -402,7 +406,8 @@ class PrivacyBudgetTests(unittest.TestCase):
                 store=target,
                 resume_store=source,
             )
-        self.assertEqual(parse.call_count, 1)
+        self.assertEqual(parse.call_count, 2)
+        self.assertFalse(parse.call_args_list[-1].kwargs["inspect_code"])
         key = engine.cache_key(artifact["sha256"], self.limits, "standard")
         self.assertNotEqual(old["cache_key"], key)
         self.assertEqual(results[artifact["sha256"]]["cache_key"], key)

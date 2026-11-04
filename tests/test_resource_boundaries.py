@@ -728,7 +728,7 @@ raise SystemExit(analyze.scan(args))
             result = binary.dex_index(data, self.limits, ObservedBudget(self.limits))
         self.assertEqual(result["scanned_methods"], 1)
         self.assertEqual(result["gaps"], [])
-        self.assertEqual(len(executed), 4098)
+        self.assertEqual(len(executed), 8196)
         checkpoints.append(len(executed))
         self.assertLessEqual(
             max(after - before for before, after in pairwise(checkpoints)),

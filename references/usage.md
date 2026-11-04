@@ -164,11 +164,29 @@ Recommendation projections preserve the recorded action, change requirement and 
 
 Recorded actions and the Markdown action table are review prompts, not package-disabling decisions. AI assessments follow [User Advice](user-advice.md) and save a separate `user-advice.md` when running the Skill. The CLI alone does not generate a personalized action assessment. Neither installation classification nor a priority score proves that an app is safe to disable.
 
-Pagination limits range from 1 to 500; inspect `total` to determine subsequent pages. URL query parameters, fragments, and credentials are redacted by default; `--include-sensitive` is reserved for authorized local inspection of original values.
+Pagination limits range from 1 to 500; inspect `has_more` and `next_offset` to continue until the selected scope is exhausted. `total` is the matching population, independent of the display limit. URL query parameters, fragments, and credentials are redacted by default; `--include-sensitive` is reserved for authorized local inspection of original values.
+
+Use `summary.facts` and each application's `facts` for counting and coverage. Endpoint and SDK totals use app-scope records once, not artifact plus app records. SDK records, names and affected application groups have separate units. Permission records distinguish Manifest declarations and snapshot-only grants. Inventory targets, applications with/without APKs and artifact statuses use separate denominators. Tables report total/shown/not_shown; no display cap establishes the audit scope.
 
 New SQLite databases apply exact IDs, counts, and pagination to indexed facts; evidence IDs use persisted references instead of rescanning every endpoint and signal. Summaries use committed lightweight application views, and Markdown stops reading display collections at the requested row limits. Substring filters preserve Unicode casefold behavior and can still scan candidates; known package scopes and exact IDs narrow that work. Deep offsets and exact counts can still traverse indexes. Legacy `analysis.json` remains accepted, but is loaded as a whole and rejected above 256 MiB; use the explicit `analysis.sqlite3` path for large reports. A database is authoritative only for its own task; the query command does not silently substitute a neighboring database for a requested JSON file.
 
 New tasks write `store_version: 3`, including bounded method/field structure and path findings with compact views and evidence references committed alongside application facts. The existing version 1/2 readers remain, without a new migration framework. Resume writes version 3 in a new directory, checks engine/rule/model identities and rebuilds application analysis without modifying the source. Older programs do not read version 3 databases; JSON retains schema 1 and existing field meanings. Evidence references add disk space but do not duplicate evidence bodies.
+
+## Preparing an Application Assessment
+
+```sh
+python3 scripts/assess_results.py prepare TASK/analysis.sqlite3 \
+  --output TASK/assessment-draft
+
+python3 scripts/assess_results.py validate TASK/analysis.sqlite3 \
+  --assessment TASK/assessment-draft/assessment.json
+
+python3 scripts/assess_results.py render TASK/analysis.sqlite3 \
+  --assessment TASK/assessment-draft/assessment.json \
+  --output TASK/assessment-final --language zh-CN
+```
+
+Fill the draft after inspecting each application's evidence. Preparation registers every group; validation checks identity, references, evidence levels, review states and action prerequisites. `PASS` / exit code 0 is structural validation, not a completed audit: inspect `outstanding_review`, `unavailable_code`, state counts and `analysis_status`. Rendering derives source counts and review states, and formats the AI-authored claim text and validated reference IDs into a separate `user-advice.md`, preserving the source report. It does not embed the cited evidence bodies or establish that free-text claims are justified; retrieve and inspect the referenced records. See the [assessment contract](assessment.md) for claim types, prerequisites, revision handling and publication review.
 
 ## Re-exporting Reports
 
@@ -190,6 +208,8 @@ Exports summary JSON, Markdown, all domain candidates, and telemetry domain cand
 | `progress.json` | Last task milestone; inspect database checkpoints and coverage for authoritative completion |
 | `summary.json` | Redacted summary with an overview of up to 20 applications |
 | `report.md` | Base Markdown report with bounded table views (default 100 rows per table) |
+| `assessment.json` | Separate AI-filled application register, source-bound claims and conditional decisions; created by `assess_results.py` |
+| `user-advice.md` | Advice rendered from the validated register; review completion and input gaps remain explicit |
 | `domains.txt` | All extracted host and bare-domain candidates; may include documentation, package names, or test fixtures |
 | `telemetry-domains.txt` | Telemetry host candidates supported by paths or SDK rules; does not prove actual upload |
 | `artifacts/` | Input snapshots keyed by content hash |

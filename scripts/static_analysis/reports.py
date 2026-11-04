@@ -1,4 +1,3 @@
-import heapq
 import html
 import json
 import re
@@ -17,6 +16,7 @@ from .common import (
     read_json,
 )
 from .endpoints import sanitized
+from .facts import application_facts, report_facts, system_classification
 from .storage import (
     COMPLETE_COVERAGE_STATUSES,
     EVIDENCE_SECTIONS,
@@ -74,11 +74,14 @@ def close_report(report):
 
 def _application_view(app):
     records = app.get("signals")
-    return (
+    view = (
         records.store.app_view(app)
         if isinstance(records, Records)
         else application_view(app)
     )
+    if "facts" not in view:
+        view = {**view, "facts": application_facts(app, view["signals"])}
+    return view
 
 
 def installation_context(app):
@@ -93,19 +96,13 @@ def installation_context(app):
         ),
         "UNAVAILABLE",
     )
-    flags = installation.get("flags")
-    is_system = (
-        "SYSTEM" in flags
-        if isinstance(flags, list) and flags and metadata_status == "COMPLETE"
-        else None
-    )
     return {
         "user": installation.get("user", app["user"]),
         **{
             key: installation.get(key)
             for key in ("uid", "app_id", "installer", "shared_user", "flags")
         },
-        "is_system": is_system,
+        "is_system": system_classification(app),
         "package_metadata_status": metadata_status,
         "appops": installation.get("appops", {}),
         "special_access": installation.get("special_access", {}),
@@ -133,8 +130,11 @@ def recommendation_context(app):
 
 
 def app_summary(app):
+    view = _application_view(app)
     return {
-        **_application_view(app)["summary"],
+        **view["summary"],
+        "facts": view["facts"],
+        "signal_summary": view["signals"],
         "installation": installation_context(app),
         "recommendations": recommendation_context(app),
     }
@@ -144,6 +144,7 @@ def summary(report, cancel=None, budget=None):
     check_resources(cancel, budget)
     statuses = Counter(item["status"] for item in report.get("stages", []))
     review_total = 0
+    ranked = []
 
     def applications():
         nonlocal review_total
@@ -152,19 +153,19 @@ def summary(report, cancel=None, budget=None):
             view = _application_view(app)
             statuses.update(view["coverage_counts"])
             review_total += bool(view["summary"]["priority"].get("reasons"))
-            yield view["summary"]
+            ranked.append(view["summary"])
+            ranked.sort(key=lambda value: (-value["priority"]["score"], value["id"]))
+            del ranked[20:]
+            yield app, view
 
-    ranked = heapq.nsmallest(
-        20,
-        applications(),
-        key=lambda app: (-app["priority"]["score"], app["id"]),
-    )
+    facts = report_facts(report, applications(), cancel, budget)
     return sanitized(
         {
             "schema_version": report["schema_version"],
             "engine_version": report["engine_version"],
             "run": report["run"],
             "totals": report["totals"],
+            "facts": facts,
             "coverage_counts": dict(sorted(statuses.items())),
             "limitations": report["limitations"],
             "apps": ranked,
@@ -317,11 +318,15 @@ def query(
         "offset": offset,
         "limit": limit,
         "items": selected,
+        "has_more": offset + len(selected) < total,
+        "next_offset": offset + len(selected)
+        if offset + len(selected) < total
+        else None,
     }
     return result if include_sensitive else sanitized(result)
 
 
-def markdown(report, limit=100, cancel=None, budget=None):
+def markdown(report, limit=100, cancel=None, budget=None, *, facts=None):
     check_resources(cancel, budget)
     template = Path(__file__).resolve().parents[2] / "references" / "report-template.md"
 
@@ -350,6 +355,7 @@ def markdown(report, limit=100, cancel=None, budget=None):
         )
     }
     gap_count = 0
+    table_totals = Counter()
 
     def append(name, values):
         check_resources(cancel, budget)
@@ -363,6 +369,24 @@ def markdown(report, limit=100, cancel=None, budget=None):
         package = app["package"] or app["id"]
         view = _application_view(app)
         gap_count += view["gap_count"]
+        table_totals.update(
+            {
+                "apps": 1,
+                "recommendations": 1,
+                "permissions": len(app["permissions"]),
+                "capabilities": len(app["capabilities"]),
+                "findings": len(app["findings"]),
+                "sdks": len(app["sdks"]),
+                "signals": len(view["signals"]),
+                "endpoints": len(app["endpoints"]),
+                "gaps": view["gap_count"],
+                "components": sum(
+                    component["exported"] is not False
+                    for manifest in app["manifests"]
+                    for component in manifest["components"]
+                ),
+            }
+        )
         append(
             "apps",
             (
@@ -520,6 +544,7 @@ def markdown(report, limit=100, cancel=None, budget=None):
         check_resources(cancel, budget)
         if item["status"] not in COMPLETE_COVERAGE_STATUSES:
             gap_count += 1
+            table_totals["gaps"] += 1
             append(
                 "gaps",
                 (
@@ -538,6 +563,15 @@ def markdown(report, limit=100, cancel=None, budget=None):
         "endpoint_count": report["totals"]["endpoints"],
         "gap_count": gap_count,
         "view_limit": limit,
+        "table_coverage": "\n".join(
+            f"- {name}: total={table_totals[name]}, shown={len(rows)}, not_shown={max(0, table_totals[name] - len(rows))}."
+            for name, rows in tables.items()
+        ),
+        "facts": json.dumps(
+            facts if facts is not None else summary(report, cancel, budget)["facts"],
+            ensure_ascii=True,
+            indent=2,
+        ).replace("`", "\\u0060"),
         **{name: "\n".join(rows) for name, rows in tables.items()},
         "limitations": "\n".join("- " + cell(item) for item in report["limitations"]),
     }
@@ -556,12 +590,11 @@ def export_reports(
     output.mkdir(parents=True, exist_ok=True)
     if write_analysis:
         atomic_json(output / "analysis.json", report, cancel, budget)
-    atomic_json(
-        output / "summary.json", summary(report, cancel, budget), cancel, budget
-    )
+    overview = summary(report, cancel, budget)
+    atomic_json(output / "summary.json", overview, cancel, budget)
     atomic_text(
         output / "report.md",
-        markdown(report, view_limit, cancel, budget),
+        markdown(report, view_limit, cancel, budget, facts=overview["facts"]),
         cancel,
         budget,
     )

@@ -48,6 +48,10 @@ Components preserve explicit exported status, target SDK default derivations, ap
 
 ## Stage Statuses
 
+The summary's `facts` is the authoritative counting projection shared with application queries and Markdown. Endpoint counts are app-scope candidate records; SDK counts distinguish match records, distinct names and affected application groups. Artifact-scope provenance is not another population to add. Permission counts distinguish Manifest declarations and snapshot-only records. Inventory targets, application groups with/without APKs and unique artifact status counts use separate denominators. Captured system flags establish neither factory installation nor user intent. Older results without selection metrics retain an explicit unknown reason.
+
+Summary Top 20 and Markdown row limits are display limits. Each Markdown table reports total/shown/not_shown; query pages expose `has_more` and `next_offset`. Prepare a full [assessment register](assessment.md) to account for every group, then track reviewed, pending, deferred and metadata-only states independently of parser completion. Validation PASS does not mean all evidence has been reviewed.
+
 | Status | Meaning |
 |---|---|
 | `COMPLETE` | Stage finished within implemented capabilities and current input scope |
@@ -62,6 +66,10 @@ Components preserve explicit exported status, target SDK default derivations, ap
 Restored collection stages use `PARTIAL` with `original_status: CANCELLED` to preserve a historical acquisition interruption without treating it as cancellation of the current execution. Referenced source snapshots remain unchanged.
 
 Dataflow is bounded by supported instructions, external models, paths and resources. Unknown invocations, native/abstract methods, unresolved callbacks, unsupported instructions and exhausted budgets are reported in dataflow stage metrics. Quick mode defers method bodies and E3/E4. Complete resource evaluation, native semantics and actual runtime verification remain unavailable; normal runs can still have overall status `PARTIAL`.
+
+Quick-mode definition inventory counts/completeness, retained-body coverage counts, and code-reference scan counts/completeness are `null` because those checks did not execute. Parsed method-ID/field table sizes remain known. Operational statistics such as scanned methods can still be zero: they count work performed, not coverage of the uninspected definitions. An executed check that finds no definitions reports zero with complete coverage; a skipped check does not. Archives with duplicate member paths are rejected before any member parsing in all modes, so their DEX members cannot be selected or decoded by an ambiguous filename.
+
+`dex_body_selection` reports bounded candidates, retained bodies, code-unit budgets, omitted neighbors and actual second-pass reads. Dataflow metrics separate definitions considered, index omissions, roots started, roots not started, local truncations, missing bodies and executions returned (`methods`). Returned roots may still have unknown operations. Reason occurrence counts continue after the located gap display cap; neither samples nor candidate counts establish completeness.
 
 Job completion, artifact coverage, and final report completion are separate facts. Progress `done` includes failed jobs; inspect per-status counts and stages. A durable checkpoint can contain partial evidence without qualifying as a successful cache entry. A resumed partial collection preserves missing targets as gaps, and never upgrades uncollected APKs or uncaptured grant state to complete coverage.
 

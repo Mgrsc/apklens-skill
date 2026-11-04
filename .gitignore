@@ -22,6 +22,8 @@ snapshot.json
 progress.json
 summary.json
 report.md
+assessment.json
+user-advice.md
 domains.txt
 telemetry-domains.txt
 package-snapshot.json

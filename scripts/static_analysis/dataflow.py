@@ -1,7 +1,7 @@
 import copy
 import re
 import sys
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -13,6 +13,16 @@ from .common import (
     stable_id,
     stage,
 )
+from .method_selection import (
+    MAX_CANDIDATE_FACTOR,
+    MAX_METHOD_TARGETS,
+    DefinitionSummaryError,
+    MethodSelection,
+    candidate_order,
+    definition_digest,
+    definition_occurrences,
+    definition_summary,
+)
 from .privacy_models import (
     AUDIO_READS,
     BOUNDARY_OWNERS,
@@ -20,11 +30,14 @@ from .privacy_models import (
     SCREEN_SURFACE,
     SOURCE_METHODS,
     TRANSFORMS,
+    invocation_roles,
 )
 
 MAX_CALL_DEPTH = 4
 MAX_METHOD_STATES = 128
 MAX_APP_STEPS = 100000
+MAX_ROOT_STEPS = 2048
+MAX_GAP_REASON_GROUPS = 64
 MAX_HEAP_OBJECTS = 256
 MAX_PATH_NODES = 32
 MAX_VALUE_SOURCES = 8
@@ -98,13 +111,29 @@ def evidence_path_key(category, evidence_ids, endpoints):
     return category, tuple(evidence_ids), tuple(sorted(set(endpoints)))
 
 
+class RootBudgetExceeded(BudgetExceeded):
+    pass
+
+
 class Analyzer:
-    def __init__(self, methods, limits, cancel=None):
+    def __init__(self, methods, limits, cancel=None, definition_summaries=None):
         self.methods = methods
+        self.definition_summaries = definition_summaries
         self.limits = limits
         self.budget = Budget(limits, cancel)
         self.index = {}
         self.gaps = {}
+        self.gap_counts = Counter()
+        self.ambiguous = set()
+        self.root_steps = 0
+        self.active_root = None
+        self.roots_started = 0
+        self.roots_truncated = 0
+        self.roots_missing_body = 0
+        self.definitions_considered = 0
+        self.index_omitted = 0
+        self.definition_inventory = []
+        self.interpretation_deferred = False
         self.flows = {}
         self.flow_groups = {}
         self.variant_groups = OrderedDict()
@@ -116,6 +145,15 @@ class Analyzer:
 
     def gap(self, reason, node=None):
         source = node.record() if node else {}
+        if node is not None and self.active_root:
+            source["candidate_root"] = self.active_root
+        group = reason.split(": ", 1)[0]
+        if (
+            group not in self.gap_counts
+            and len(self.gap_counts) >= MAX_GAP_REASON_GROUPS
+        ):
+            group = "Additional reason groups exceed the summary budget"
+        self.gap_counts[group] += 1
         identity = stable_id("flow_gap", reason, source)
         if len(self.gaps) < MAX_GAPS:
             self.gaps[identity] = {**source, "id": identity, "reason": reason}
@@ -1039,7 +1077,7 @@ class Analyzer:
     def lookup(self, signature, *, cache=True):
         self.budget.check()
         records = self.index.get(signature, [])
-        if len(records) != 1:
+        if len(records) != 1 or signature in self.ambiguous:
             return None
         position, identity = records[0]
         if hasattr(self.methods, "page"):
@@ -1176,6 +1214,15 @@ class Analyzer:
                     self.budget.check()
                 if self.steps > MAX_APP_STEPS:
                     raise BudgetExceeded("Application dataflow step budget exceeded")
+                self.root_steps += 1
+                if self.root_steps > MAX_ROOT_STEPS:
+                    self.gap(
+                        "Candidate-root dataflow step budget exceeded",
+                        self.node(method, instructions[position]),
+                    )
+                    raise RootBudgetExceeded(
+                        "Candidate-root dataflow step budget exceeded"
+                    )
                 item = instructions[position]
                 node = self.node(method, item)
                 if position in path_positions:
@@ -1396,7 +1443,10 @@ class Analyzer:
                                 )
                             result, state = outcomes[0]
                     else:
-                        if len(self.index.get(target, ())) > 1:
+                        if (
+                            len(self.index.get(target, ())) > 1
+                            or target in self.ambiguous
+                        ):
                             self.gap("Ambiguous duplicate method definition", node)
                             break
                         result = self.external(
@@ -1421,20 +1471,162 @@ class Analyzer:
         return returns
 
     def run(self):
+        admission = {}
+        definition_artifacts = {}
         try:
-            for index, method in enumerate(self.methods):
+            pool = MethodSelection(
+                self.limits, self.budget, MAX_APP_METHODS * MAX_CANDIDATE_FACTOR
+            )
+            for position, method in enumerate(self.methods):
                 self.budget.check()
-                if index >= MAX_APP_METHODS:
-                    self.gap("Application method index budget exceeded")
-                    break
-                self.index.setdefault(method["signature"], []).append(
-                    (index, method["id"])
+                self.definitions_considered += 1
+                roles = set(method.get("candidate_roles", ()))
+                targets = list(method.get("call_targets", ()))
+                if "candidate_roles" not in method:
+                    for item in method.get("instructions", ()):
+                        target = item.get("target")
+                        if isinstance(target, str) and "->" in target:
+                            roles.update(invocation_roles(target))
+                            if (
+                                target not in targets
+                                and len(targets) < MAX_METHOD_TARGETS
+                            ):
+                                targets.append(target)
+                            elif target not in targets:
+                                pool.neighbor_truncations += 1
+                pool.add(
+                    {
+                        key: method[key]
+                        for key in (
+                            "id",
+                            "signature",
+                            "artifact",
+                            "entry",
+                            "code_offset",
+                        )
+                        if key in method
+                    }
+                    | {
+                        "position": position,
+                        "definition_order": position,
+                        "candidate_roles": sorted(roles),
+                        "call_targets": targets,
+                        "code_units": method.get(
+                            "code_units", len(method.get("instructions", ()))
+                        ),
+                        "ambiguous_definition": method.get(
+                            "ambiguous_definition", False
+                        ),
+                    }
                 )
+            methods = [value[0] for value in pool.items.values()]
+            for admitted, index in enumerate(
+                candidate_order(methods, self.budget, admission)
+            ):
+                if admitted >= MAX_APP_METHODS:
+                    break
+                method = methods[index]
+                signature = method["signature"]
+                self.index.setdefault(signature, []).append(
+                    (method["position"], method["id"])
+                )
+                digest = definition_digest(signature)
+                definition_artifacts.setdefault(method.get("artifact"), set()).add(
+                    digest
+                )
+                if (
+                    method["ambiguous_definition"]
+                    or pool.definitions.counts[digest] > 1
+                ):
+                    self.ambiguous.add(signature)
+            self.index_omitted = self.definitions_considered - sum(
+                len(value) for value in self.index.values()
+            )
+            admission.update(
+                candidate_pool_omitted=pool.evicted,
+                candidate_metadata_bytes=pool.size_bytes,
+                neighbor_truncations=pool.neighbor_truncations,
+            )
+            if self.index_omitted:
+                self.gap("Application method index budget exceeded")
+            if (
+                admission.get("neighbor_edges_omitted")
+                or admission["neighbor_truncations"]
+            ):
+                self.gap("Application call-neighbor budget exceeded")
+            del methods, pool
+            if self.definition_summaries is not None:
+                source_counts = {
+                    definition_digest(signature): 0 for signature in self.index
+                }
+                for artifact in self.definition_summaries:
+                    self.budget.check()
+                    inventory = {
+                        "artifact": artifact["sha256"],
+                        "complete": False,
+                        "reason": "Definition inventory is missing or incomplete",
+                    }
+                    self.definition_inventory.append(inventory)
+                    try:
+                        summary = artifact.get("definition_summary")
+                        if summary is None:
+                            counts = artifact.get("definition_counts")
+                            summary = definition_summary(
+                                counts if counts is not None else {},
+                                counts is not None
+                                and artifact.get("definition_inventory_complete")
+                                is True
+                                and not artifact.get("definition_identities_truncated"),
+                                self.budget,
+                            )
+                        if (
+                            not isinstance(summary, dict)
+                            or summary.get("complete") is not True
+                        ):
+                            self.interpretation_deferred = True
+                            continue
+                        inventory.update(complete=True, reason=None)
+                        for digest, count in definition_occurrences(
+                            summary, source_counts, self.budget
+                        ):
+                            if not count and digest in definition_artifacts.get(
+                                artifact["sha256"], ()
+                            ):
+                                inventory.update(
+                                    complete=False,
+                                    reason="Definition identity summary omits a retained candidate definition",
+                                )
+                                self.interpretation_deferred = True
+                            source_counts[digest] = min(
+                                2, source_counts[digest] + count
+                            )
+                    except DefinitionSummaryError as error:
+                        inventory.update(complete=False, reason=str(error))
+                        self.interpretation_deferred = True
+                if any(count == 0 for count in source_counts.values()):
+                    self.interpretation_deferred = True
+                if self.interpretation_deferred:
+                    raise BudgetExceeded(
+                        "Artifact definition identity coverage is incomplete; interpretation deferred; inspect definition_inventory by artifact"
+                    )
+                self.ambiguous.update(
+                    signature
+                    for signature in self.index
+                    if source_counts[definition_digest(signature)] > 1
+                )
+                del source_counts
+            del definition_artifacts
             for signature in self.index:
+                self.budget.check()
                 method = self.lookup(signature, cache=False)
                 if method is None:
                     self.gap("Ambiguous duplicate method definition: " + signature)
                     continue
+                self.roots_started += 1
+                self.root_steps = 0
+                self.active_root = signature
+                if method.get("gap") or not method.get("instructions"):
+                    self.roots_missing_body += 1
                 initial = {"heap": {}, "files": {}, "statics": {}, "conditions": []}
                 arguments = [EMPTY] * method["parameters"]
                 if arguments and not method["access"] & 8:
@@ -1443,9 +1635,12 @@ class Analyzer:
                         signature.split("->", 1)[0],
                         self.node(method, {"offset": 0, "opcode": 0}),
                     )
-                self.execute(method, arguments, initial)
+                try:
+                    self.execute(method, arguments, initial)
+                    self.completed += 1
+                except RootBudgetExceeded:
+                    self.roots_truncated += 1
                 self.budget.check()
-                self.completed += 1
             if not self.index:
                 self.gap(
                     "No indexed method definitions are available for dataflow analysis"
@@ -1463,7 +1658,19 @@ class Analyzer:
                 reason="Bounded static model; inspect dataflow gaps and runtime limitations",
                 methods=self.completed,
                 indexed_methods=len(self.index),
-                entry_policy="All indexed definitions are candidate roots; runtime reachability is unverified",
+                entry_policy="Bounded source/caller/network neighborhoods and ordinary candidate roots; runtime reachability is unverified",
+                definitions_considered=self.definitions_considered,
+                index_omitted=self.index_omitted,
+                definition_inventory=self.definition_inventory,
+                interpretation_deferred=self.interpretation_deferred,
+                roots_started=self.roots_started,
+                roots_not_started=len(self.index) - self.roots_started,
+                roots_locally_truncated=self.roots_truncated,
+                roots_missing_body=self.roots_missing_body,
+                root_step_limit=MAX_ROOT_STEPS,
+                admission=admission,
+                gap_occurrences=dict(sorted(self.gap_counts.items())),
+                gap_samples_truncated="truncated" in self.gaps,
                 steps=self.steps,
                 gaps=list(self.gaps.values()),
                 model_version=MODEL_VERSION,
@@ -1473,5 +1680,5 @@ class Analyzer:
         return list(self.flows.values()), coverage
 
 
-def analyze_dataflow(methods, limits, cancel=None):
-    return Analyzer(methods, limits, cancel).run()
+def analyze_dataflow(methods, limits, cancel=None, definition_summaries=None):
+    return Analyzer(methods, limits, cancel, definition_summaries).run()

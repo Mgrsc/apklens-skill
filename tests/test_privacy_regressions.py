@@ -520,9 +520,16 @@ class PrivacyRegressionTests(unittest.TestCase):
             reads[kwargs.get("identity")] += 1
             return original_page(*args, **kwargs)
 
+        sizes = []
+        for method in methods[:3]:
+            analyzer.cache_method(method["id"], method)
+            sizes.append(analyzer.method_cache[method["id"]][1])
+        byte_limit = sum(sorted(sizes)[-2:])
+        analyzer.method_cache.clear()
+        analyzer.method_cache_bytes = 0
         with (
             patch.object(dataflow, "MAX_METHOD_CACHE_ENTRIES", 2),
-            patch.object(dataflow, "MAX_METHOD_CACHE_BYTES", 4096),
+            patch.object(dataflow, "MAX_METHOD_CACHE_BYTES", byte_limit),
             patch.object(analyzer.methods, "page", side_effect=paged),
         ):
             for index in (0, 1, 0, 2, 1):
@@ -530,7 +537,7 @@ class PrivacyRegressionTests(unittest.TestCase):
                     analyzer.lookup(methods[index]["signature"]), methods[index]
                 )
                 self.assertLessEqual(len(analyzer.method_cache), 2)
-                self.assertLessEqual(analyzer.method_cache_bytes, 4096)
+                self.assertLessEqual(analyzer.method_cache_bytes, byte_limit)
             self.assertEqual(reads[methods[0]["id"]], 1)
             self.assertEqual(reads[methods[1]["id"]], 2)
             cached = list(analyzer.method_cache)
@@ -705,7 +712,8 @@ class PrivacyRegressionTests(unittest.TestCase):
                 store=target,
                 resume_store=source,
             )
-        self.assertEqual(parsed.call_count, 1)
+        self.assertEqual(parsed.call_count, 2)
+        self.assertFalse(parsed.call_args_list[-1].kwargs["inspect_code"])
         key = engine.cache_key(artifact["sha256"], self.limits, "standard")
         self.assertNotEqual(old["cache_key"], key)
         self.assertEqual(results[artifact["sha256"]]["cache_key"], key)

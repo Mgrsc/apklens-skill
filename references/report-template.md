@@ -7,6 +7,18 @@
 
 This report is derived from static artifacts and optional one-time device snapshots. It does not prove that applications actually collected or transmitted data. URL query parameters and credentials are redacted in this view; local JSON, SQLite, and device snapshots may contain sensitive details. Markdown tables show up to {{view_limit}} items per category; query the task's `analysis.sqlite3` in pages for large results, or use a supported legacy `analysis.json` input.
 
+## Counting and Coverage Facts
+
+Application and artifact scopes must never be added together. SDK matches are records, not distinct SDKs or applications. Inventory targets, supplied APKs, parser outcomes, method-body selection and assessment completion are separate measures. System classification does not establish factory installation or user intent.
+
+```json
+{{facts}}
+```
+
+Table display coverage follows; these limits do not establish which applications were assessed:
+
+{{table_coverage}}
+
 ## User Actions and Review Context
 
 The table provides recorded review prompts and captured context. For a user-facing assessment, give application-specific recommendations to retain and restrict unnecessary access, uninstall an unwanted third-party app, consider disabling an unused optional system feature after dependency review, or defer a device change pending missing evidence. Explain the reason, finding/evidence IDs, prerequisites, expected feature loss, verification and recovery. The Skill's `references/user-advice.md` defines the decision criteria; the AI assessment is saved separately as `user-advice.md` when the analysis is performed through the Skill.

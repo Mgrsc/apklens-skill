@@ -352,17 +352,19 @@ def instruction_width(units, position):
     raise AnalysisError(f"Unsupported DEX opcode: 0x{opcode:02x}")
 
 
-def dex_index(data, limits, budget, inspect_code=True, structure_budget=None):
-    from .dex_ir import (
-        MAX_ARTIFACT_UNITS,
-        MAX_INDEXED_METHODS,
-        MAX_METHOD_UNITS,
-        decode_instruction,
-        exception_regions,
-    )
+def dex_index(
+    data,
+    limits,
+    budget,
+    inspect_code=True,
+    selection=None,
+    entry="",
+):
+    from .method_selection import MAX_METHOD_TARGETS, MethodSelection
+    from .privacy_models import invocation_roles
 
-    if structure_budget is None:
-        structure_budget = {"methods": 0, "units": 0}
+    deferred = selection is not None
+    selection = selection or MethodSelection(limits, budget)
     reader = BinaryReader(data)
     reader.require(0, 112)
     if data[:4] != b"dex\n" or data[4:7] not in SUPPORTED_DEX_VERSIONS or data[7] != 0:
@@ -481,8 +483,81 @@ def dex_index(data, limits, budget, inspect_code=True, structure_budget=None):
     gaps = []
     scanned_methods = 0
     reference_count = 0
-    bodies = []
+    reference_scan_stopped = False
     structure_gaps = []
+    scan_stopped = False
+    definition_inventory_complete = True if inspect_code else None
+
+    def discover_code(body, code_offset):
+        nonlocal reference_count, reference_scan_stopped
+        reader.require(code_offset, 16)
+        unit_count = reader.u32(code_offset + 12)
+        body.update(
+            registers=reader.u16(code_offset),
+            parameters=reader.u16(code_offset + 2),
+            code_offset=code_offset,
+            code_units=unit_count,
+        )
+        reader.require(code_offset + 16, unit_count * 2)
+        if reference_scan_stopped:
+            return False
+        units = memoryview(data)[
+            code_offset + 16 : code_offset + 16 + unit_count * 2
+        ].cast("H")
+        if sys.byteorder != "little":
+            units = struct.unpack_from("<" + "H" * unit_count, data, code_offset + 16)
+        cursor = 0
+        next_budget_check = 0
+        while cursor < unit_count:
+            if cursor >= next_budget_check:
+                budget.check()
+                next_budget_check = cursor + DEX_BUDGET_CHECK_UNITS
+            width = instruction_width(units, cursor)
+            if cursor + width > unit_count:
+                raise AnalysisError("Truncated DEX instruction")
+            opcode = units[cursor] & 255
+            location = {
+                "method": body["signature"],
+                "instruction_offset": cursor,
+                "code_offset": code_offset,
+            }
+            if opcode in {0x1A, 0x1B}:
+                string_index = units[cursor + 1] | (
+                    units[cursor + 2] << 16 if opcode == 0x1B else 0
+                )
+                string_at(string_index)
+                references.setdefault(string_index, []).append(location)
+                reference_count += 1
+            elif (
+                0x6E <= opcode <= 0x72
+                or 0x74 <= opcode <= 0x78
+                or opcode in {0xFA, 0xFB}
+            ):
+                target_index = units[cursor + 1]
+                if target_index >= len(methods):
+                    raise AnalysisError(
+                        "DEX invocation target is outside the method table"
+                    )
+                target = methods[target_index]
+                calls.append({**location, "target": target})
+                for role in invocation_roles(target):
+                    if role not in body["candidate_roles"]:
+                        body["candidate_roles"].append(role)
+                if target not in body["call_targets"]:
+                    if len(body["call_targets"]) < MAX_METHOD_TARGETS:
+                        body["call_targets"].append(target)
+                    else:
+                        selection.neighbor_truncations += 1
+                reference_count += 1
+            elif opcode in {0xFC, 0xFD}:
+                gaps.append("DEX invoke-custom call sites are not resolved")
+            if reference_count > limits.max_references:
+                gaps.append("DEX reference count exceeds the budget")
+                reference_scan_stopped = True
+                return False
+            cursor += width
+        return True
+
     if inspect_code:
         for class_index in range(count):
             budget.check()
@@ -519,122 +594,46 @@ def dex_index(data, limits, budget, inspect_code=True, structure_budget=None):
                             "instructions": [],
                             "handlers": [],
                         }
-                        if structure_budget["methods"] < min(
-                            MAX_INDEXED_METHODS, limits.max_results
-                        ):
-                            bodies.append(body)
-                            structure_budget["methods"] += 1
-                        else:
-                            structure_gaps.append("DEX method index budget exceeded")
-                            body = None
+                        body.update(
+                            entry=entry,
+                            definition_order=selection.considered,
+                            code_units=0,
+                            registers=0,
+                            parameters=0,
+                            call_targets=[],
+                            candidate_roles=[],
+                        )
                         current_body = body
                         if not code_offset:
-                            if body is not None:
-                                body.update(registers=0, parameters=0)
+                            body.update(registers=0, parameters=0)
+                            selection.add(body)
                             current_body = None
                             continue
-                        reader.require(code_offset, 16)
-                        unit_count = reader.u32(code_offset + 12)
-                        if body is not None:
-                            body.update(
-                                registers=reader.u16(code_offset),
-                                parameters=reader.u16(code_offset + 2),
-                                code_offset=code_offset,
-                            )
-                            if unit_count > MAX_METHOD_UNITS or structure_budget[
-                                "units"
-                            ] + unit_count > min(
-                                MAX_ARTIFACT_UNITS, limits.max_references
-                            ):
-                                body["gap"] = "DEX instruction index budget exceeded"
-                                structure_gaps.append(body["gap"])
-                            else:
-                                structure_budget["units"] += unit_count
-                                try:
-                                    body["handlers"] = exception_regions(
-                                        reader, code_offset, unit_count, types, budget
-                                    )
-                                except (Cancelled, MemoryBudgetExceeded):
-                                    raise
-                                except AnalysisError as error:
-                                    body["gap"] = str(error)
-                                    structure_gaps.append(str(error))
-                        reader.require(code_offset + 16, unit_count * 2)
-                        units = memoryview(data)[
-                            code_offset + 16 : code_offset + 16 + unit_count * 2
-                        ].cast("H")
-                        if sys.byteorder != "little":
-                            units = struct.unpack_from(
-                                "<" + "H" * unit_count, data, code_offset + 16
-                            )
-                        cursor = 0
-                        next_budget_check = 0
-                        while cursor < unit_count:
-                            if cursor >= next_budget_check:
-                                budget.check()
-                                next_budget_check = cursor + DEX_BUDGET_CHECK_UNITS
-                            width = instruction_width(units, cursor)
-                            if cursor + width > unit_count:
-                                raise AnalysisError("Truncated DEX instruction")
-                            opcode = units[cursor] & 255
-                            if body is not None and not body.get("gap"):
-                                body["instructions"].append(
-                                    decode_instruction(
-                                        units,
-                                        cursor,
-                                        width,
-                                        strings,
-                                        types,
-                                        fields,
-                                        methods,
-                                    )
-                                )
-                            location = {
-                                "method": methods[method_index],
-                                "instruction_offset": cursor,
-                                "code_offset": code_offset,
-                            }
-                            if opcode in {0x1A, 0x1B}:
-                                string_index = units[cursor + 1] | (
-                                    units[cursor + 2] << 16 if opcode == 0x1B else 0
-                                )
-                                string_at(string_index)
-                                references.setdefault(string_index, []).append(location)
-                                reference_count += 1
-                            elif (
-                                0x6E <= opcode <= 0x72
-                                or 0x74 <= opcode <= 0x78
-                                or opcode in {0xFA, 0xFB}
-                            ):
-                                target_index = units[cursor + 1]
-                                if target_index >= len(methods):
-                                    raise AnalysisError(
-                                        "DEX invocation target is outside the method table"
-                                    )
-                                calls.append(
-                                    {**location, "target": methods[target_index]}
-                                )
-                                reference_count += 1
-                            elif opcode in {0xFC, 0xFD}:
-                                gaps.append(
-                                    "DEX invoke-custom call sites are not resolved"
-                                )
-                            if reference_count > limits.max_references:
-                                raise BudgetExceeded(
-                                    "DEX reference count exceeds the budget"
-                                )
-                            cursor += width
-                        scanned_methods += 1
+                        body["code_offset"] = code_offset
+                        try:
+                            scanned = discover_code(body, code_offset)
+                        except (Cancelled, MemoryBudgetExceeded, BudgetExceeded):
+                            raise
+                        except AnalysisError as error:
+                            gaps.append(str(error))
+                            body["gap"] = str(error)
+                            scanned = False
+                        body["candidate_roles"].sort()
+                        selection.add(body)
+                        scanned_methods += scanned
                         current_body = None
             except (Cancelled, MemoryBudgetExceeded):
                 raise
             except AnalysisError as error:
+                definition_inventory_complete = False
                 gaps.append(str(error))
-                if current_body is not None:
+                if current_body is not None and not isinstance(error, BudgetExceeded):
                     current_body["gap"] = str(error)
+                    selection.add(current_body)
                 if isinstance(error, BudgetExceeded):
+                    scan_stopped = True
                     break
-    return {
+    result = {
         "strings": strings,
         "types": types,
         "methods": methods,
@@ -643,9 +642,78 @@ def dex_index(data, limits, budget, inspect_code=True, structure_budget=None):
         "scanned_methods": scanned_methods,
         "gaps": sorted(set(gaps)),
         "fields": fields,
-        "bodies": bodies,
+        "bodies": [],
         "structure_gaps": sorted(set(structure_gaps)),
+        "definition_inventory_complete": definition_inventory_complete,
+        "reference_scan_complete": not gaps if inspect_code else None,
     }
+    if not deferred and inspect_code and not scan_stopped:
+        selected, metrics = selection.select()
+        result["bodies"] = decode_method_bodies(data, result, selected, budget)
+        result["selection_metrics"] = metrics
+        if metrics["body_budget_omitted"]:
+            result["structure_gaps"].append(
+                "DEX instruction or method index budget exceeded"
+            )
+        if metrics["candidate_pool_omitted"] or metrics["neighbor_truncations"]:
+            result["structure_gaps"].append("DEX candidate or neighbor budget exceeded")
+        result["structure_gaps"].extend(
+            body["gap"] for body in result["bodies"] if body.get("gap")
+        )
+        result["structure_gaps"] = sorted(set(result["structure_gaps"]))
+    return result
+
+
+def decode_method_bodies(data, index, selected, budget):
+    from .dex_ir import decode_instruction, exception_regions
+
+    reader = BinaryReader(data)
+    bodies = []
+    for metadata in selected:
+        budget.check()
+        body = {**metadata, "instructions": [], "handlers": []}
+        if not body.get("entry"):
+            body.pop("entry", None)
+        bodies.append(body)
+        if not body.get("code_offset") or body.get("gap"):
+            continue
+        try:
+            code_offset, count = body["code_offset"], body["code_units"]
+            reader.require(code_offset + 16, count * 2)
+            body["handlers"] = exception_regions(
+                reader, code_offset, count, index["types"], budget
+            )
+            units = memoryview(data)[
+                code_offset + 16 : code_offset + 16 + count * 2
+            ].cast("H")
+            if sys.byteorder != "little":
+                units = struct.unpack_from("<" + "H" * count, data, code_offset + 16)
+            cursor = 0
+            next_check = 0
+            while cursor < count:
+                if cursor >= next_check:
+                    budget.check()
+                    next_check = cursor + DEX_BUDGET_CHECK_UNITS
+                width = instruction_width(units, cursor)
+                if cursor + width > count:
+                    raise AnalysisError("Truncated DEX instruction")
+                body["instructions"].append(
+                    decode_instruction(
+                        units,
+                        cursor,
+                        width,
+                        index["strings"],
+                        index["types"],
+                        index["fields"],
+                        index["methods"],
+                    )
+                )
+                cursor += width
+        except (Cancelled, MemoryBudgetExceeded, BudgetExceeded):
+            raise
+        except AnalysisError as error:
+            body["gap"] = str(error)
+    return bodies
 
 
 def printable_strings(data, minimum=5):

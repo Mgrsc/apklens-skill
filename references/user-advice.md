@@ -4,9 +4,11 @@
 
 An analysis assessment should answer what was established, which applications deserve action, and what the user should do next. Lead with the most useful actions in the user's language, then give application-specific decisions and their evidence. Do not substitute a ranking of permissions, SDKs or endpoint counts for advice, or end by asking the user to request an action list separately.
 
-For an analysis task, save the assessment as a new `user-advice.md` beside the scripted outputs; use an unused filename if one already exists. Identify it as an AI assessment and link the underlying task and evidence. Preserve the deterministic `report.md`. For short follow-ups, answer directly unless persistence is requested.
+For an analysis task, prepare the full application register with `assess_results.py`, fill evidence-based decisions in `assessment.json`, validate it and render a new `user-advice.md` in a new directory. Follow the [assessment contract](assessment.md). Identify it as an AI assessment and link the underlying task and evidence. Preserve the deterministic `report.md`. For short follow-ups, answer directly unless persistence is requested.
 
 The scripts produce facts and review prompts; they do not establish the user's needs, complete system dependencies or safe remediation. Keep that distinction visible while still making useful recommendations. Do not claim every installed app was individually assessed when only a sample or summary was inspected. Page through applications for the requested scope; distinguish assessed apps, outstanding review and unavailable targets. Avoid repeating the same generic advice for hundreds of apps.
+
+Use the authoritative `facts` projection for numbers. App-scope endpoint candidates and SDK match records must not be added to artifact-scope records. Manifest declarations, snapshot-only permissions and shared-UID grants are separate facts. Count captured targets, targets with APKs and completed artifacts separately. SYSTEM/non-SYSTEM flags do not establish factory preload or deliberate user installation. A high score, a known SDK or an address label only changes review order; direct sensitive calls and ordinary registration URLs can deserve investigation outside the displayed summary.
 
 ## Evidence and Device Context
 

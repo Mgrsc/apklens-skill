@@ -30,8 +30,10 @@ from static_analysis.common import (
 )
 from static_analysis.device import PACKAGE_PATTERN, DeviceCollector, parse_devices
 from static_analysis.engine import analyze_many, build_apps, source_view
+from static_analysis.privacy_models import MODEL_VERSION
 from static_analysis.reports import export_reports
-from static_analysis.storage import AnalysisStore, checkpoint_source
+from static_analysis.rules import RULE_VERSION
+from static_analysis.storage import AnalysisStore, artifact_status, checkpoint_source
 from static_analysis.tasks import (
     DEFAULT_CONFIGURATION,
     load_snapshot,
@@ -502,6 +504,8 @@ def scan(args):
                 "id": run_id,
                 "status": status,
                 "mode": args.mode,
+                "rule_version": RULE_VERSION,
+                "model_version": MODEL_VERSION,
                 "started_at": started_at,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "elapsed_seconds": round(time.monotonic() - started, 3),
@@ -519,6 +523,7 @@ def scan(args):
                 {
                     **artifact,
                     "statistics": results[artifact["sha256"]].get("statistics", {}),
+                    "status": artifact_status(results[artifact["sha256"]]),
                     "cache": results[artifact["sha256"]]["cache"],
                 }
                 for artifact in artifacts

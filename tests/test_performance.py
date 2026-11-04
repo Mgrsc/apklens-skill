@@ -67,7 +67,7 @@ class PerformanceTests(unittest.TestCase):
                 caller = sys._getframe(1)
                 if (
                     not self.raised
-                    and caller.f_code.co_name == "dex_index"
+                    and caller.f_code.co_name == "discover_code"
                     and caller.f_locals.get("cursor") == 0
                 ):
                     self.raised = True

@@ -1,4 +1,4 @@
-MODEL_VERSION = "4"
+MODEL_VERSION = "5"
 SOURCE_METHODS = {}
 
 for owner, category, signatures in (
@@ -157,3 +157,27 @@ def call_signal(signature):
     ):
         return "screen_capture"
     return None
+
+
+def invocation_roles(signature):
+    roles = []
+    source = call_signal(signature)
+    if source:
+        roles.append("source:" + source)
+    owner = signature.split("->", 1)[0]
+    if owner in {
+        "Ljava/net/URL;",
+        "Ljava/net/URLConnection;",
+        "Ljava/net/HttpURLConnection;",
+        "Ljava/net/Socket;",
+        "Ljavax/net/ssl/HttpsURLConnection;",
+        "Lokhttp3/Request;",
+        "Lokhttp3/Request$Builder;",
+        "Lokhttp3/RequestBody;",
+        "Lokhttp3/OkHttpClient;",
+        "Lokhttp3/Call;",
+    }:
+        roles.append("network")
+    if signature in TRANSFORMS:
+        roles.append("transform")
+    return roles

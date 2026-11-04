@@ -577,7 +577,8 @@ class PrivacyInputTests(unittest.TestCase):
                 store=target,
                 resume_store=source,
             )
-        self.assertEqual(parse.call_count, 1)
+        self.assertEqual(parse.call_count, 2)
+        self.assertFalse(parse.call_args_list[-1].kwargs["inspect_code"])
         self.assertNotEqual(old["cache_key"], results[item["sha256"]]["cache_key"])
         self.assertEqual((self.root / "source.sqlite3").read_bytes(), before)
         apps = engine.build_apps([item], results, None, self.limits, "standard", target)

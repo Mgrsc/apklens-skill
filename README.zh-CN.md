@@ -13,6 +13,7 @@
 - **批量持久化与恢复**：使用标准库 SQLite 逐制品保存检查点，从磁盘合并和导出，支持在新目录恢复中断任务。采集快照可离线复用，无需再次复制 APK。
 - **有界隐私数据流**：跟踪已建模的敏感来源，经载荷构造、编码/加密、可解析方法和部分回调到达网络出口；未知调用与资源上限保留为覆盖缺口。
 - **严守事实边界**：区分 E0–E2 线索与 E3/E4 静态可能路径，不将其当作已观察到上传或已确认的隐私违规。
+- **具体处置建议**：AI 逐应用判断保留并限制权限、不需要时卸载，或核查依赖后考虑停用，说明证据、前提、功能影响和恢复方式；未知状态明确保留。
 
 ## 快速上手
 
@@ -49,6 +50,8 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 - `snapshot.json` / `progress.json`：可复用的采集状态与最新执行阶段。
 - `domains.txt` / `telemetry-domains.txt`：归一化的网络端点与第三方遥测域名候选。
 
+通过 Skill 执行分析时，AI 还会生成 `user-advice.md`，给出逐应用处置建议。脚本生成的 `report.md` 包含事实和核查提示；直接运行 CLI 不生成个性化处置评估。使用 `--section apps --package PACKAGE` 可查询已有安装上下文和有界建议证据样本，轻量摘要有意省略这些上下文。建议不代表已授权修改设备，审查分数高也不表示应用可以安全停用。
+
 大任务优先查询 `analysis.sqlite3`，避免整体读取 JSON 导出。数据库为 ID、分页和证据引用建立索引，轻量视图避免摘要全量扫描。新任务写入数据库版本 3，JSON 继续保持 schema 1；沿用版本 1/2 的读取路径。可用 `python3 scripts/analyze.py scan --resume previous_task_dir --output new_task_dir` 恢复任务；请保留原任务目录及其引用的 APK。恢复时在新目录重建应用分析与索引。仅采集、离线快照及内存预算详见使用参考。
 
 摘要中的 `review_required_total` 统计具有声明能力或敏感线索、需要审查的应用，不是已证实的隐私问题或传输路径数。审查排序按独立证据路径和地址分组计数，条件变体不重复加分；发现项计数仍表示实际保留记录数。每组最多保留 4 个条件变体，截断会标为 PARTIAL。方法/字段事实保留量与解释范围上限分别计算，具体预算及 E3/E4 共享覆盖指标见[隐私模型与限制](references/privacy-analysis.md)。
@@ -62,6 +65,7 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 - [使用与参数参考](references/usage.md)：完整 CLI 参数、高级过滤、配置项与查询用法。
 - [证据与覆盖定义](references/evidence-and-coverage.md)：E0–E4 证据等级、解码与阶段状态。
 - [隐私模型与限制](references/privacy-analysis.md)：支持的来源、传播、异步交接、查询示例及明确停止边界。
+- [用户处置建议](references/user-advice.md)：保留、限制权限、卸载或考虑停用的判断条件，以及证据、影响、恢复和未知项。
 - [实现与架构说明](references/implementation.md)：模块权责归属、流水线设计与性能考量。
 
 ## 开发验证

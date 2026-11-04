@@ -16,6 +16,10 @@ E3/E4 findings contain ordered source, transformation and sink evidence, modeled
 
 SDK detection records namespaces, domains, or composite rules. Domain matching respects full host and subdomain boundaries rather than arbitrary substrings; for example, `sentry.io` does not match `sentry.io.evil.example`. The presence of an SDK does not prove it is enabled, and broad vendor namespaces do not equate to telemetry.
 
+## From Evidence to User Actions
+
+User-facing assessments include practical, application-specific recommendations as defined in [User Advice](user-advice.md). Keep privacy evidence strength separate from user need and remediation impact: an unwanted optional app may be removed without a claim of wrongdoing, while an E3/E4 path does not establish safe system-package disabling. Check installation metadata, grants, shared UID, special access, dependencies and coverage; unknown state remains unknown. Permission counts, review scores and SDK labels alone do not justify a disable list. Static evidence cannot establish continuous monitoring, actual upload, malware absence or the cause of a real-world event.
+
 ## Input Sources
 
 - Device: All enumerable applications or an explicitly selected set for the specified user; all readable base/split APKs.

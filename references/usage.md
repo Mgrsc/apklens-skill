@@ -138,6 +138,9 @@ python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
   --section apps --offset 0 --limit 20
 
 python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
+  --section apps --package com.example.app --limit 20
+
+python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
   --section endpoints --package com.example.app --limit 50
 
 python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
@@ -154,6 +157,12 @@ python3 scripts/query_results.py .dev/analysis/local-001/analysis.sqlite3 \
 ```
 
 Available sections: `summary`, `apps`, `permissions`, `capabilities`, `endpoints`, `sdks`, `signals`, `findings`, `methods`, `fields`, `coverage`, and `evidence`. `summary` provides an unfilterable run overview; other sections support pagination, `--package`, `--id`, and `--contains`. A finding's `evidence_ids` identify its supporting locations. Summary fields disclose important review totals and how many applications are outside the 20-app display cap; paginate to inspect all targets.
+
+`apps` adds `installation` context and recorded `recommendations` to each application overview. Installation context includes the captured user/UID, installer, flags, shared UID, AppOps, special access and collection stages; raw paths and duplicate permission collections are omitted. Query `permissions` separately for grants. `installation=null` means no saved installation context. The projected `is_system` is unknown unless package metadata is `COMPLETE` and captured flags are nonempty; do not rely on a raw false system marker from a snapshot with missing metadata. Inspect `package_metadata_status` and stages. AppOps `default`, absent entries and unknown special access do not establish that access is allowed or denied.
+
+Recommendation projections preserve the recorded action, change requirement and execution policy. Instead of expanding all finding IDs, they expose `finding_count`, up to three `finding_id_sample` values and `finding_ids_truncated`; page through `findings` for complete relevant evidence. The lightweight `summary` intentionally omits installation context and recommendations. These projections are computed when reading saved results, including supported older databases, without rewriting them or rerunning analysis.
+
+Recorded actions and the Markdown action table are review prompts, not package-disabling decisions. AI assessments follow [User Advice](user-advice.md) and save a separate `user-advice.md` when running the Skill. The CLI alone does not generate a personalized action assessment. Neither installation classification nor a priority score proves that an app is safe to disable.
 
 Pagination limits range from 1 to 500; inspect `total` to determine subsequent pages. URL query parameters, fragments, and credentials are redacted by default; `--include-sensitive` is reserved for authorized local inspection of original values.
 

@@ -7,6 +7,18 @@
 
 This report is derived from static artifacts and optional one-time device snapshots. It does not prove that applications actually collected or transmitted data. URL query parameters and credentials are redacted in this view; local JSON, SQLite, and device snapshots may contain sensitive details. Markdown tables show up to {{view_limit}} items per category; query the task's `analysis.sqlite3` in pages for large results, or use a supported legacy `analysis.json` input.
 
+## User Actions and Review Context
+
+The table provides recorded review prompts and captured context. For a user-facing assessment, give application-specific recommendations to retain and restrict unnecessary access, uninstall an unwanted third-party app, consider disabling an unused optional system feature after dependency review, or defer a device change pending missing evidence. Explain the reason, finding/evidence IDs, prerequisites, expected feature loss, verification and recovery. The Skill's `references/user-advice.md` defines the decision criteria; the AI assessment is saved separately as `user-advice.md` when the analysis is performed through the Skill.
+
+Review priority, permission counts, SDK matches and static API references alone do not establish that disabling an app is appropriate. Usage requirements and dependency safety have not been established by these scripts. An incomplete analysis does not show that an app is safe or malicious. Changes to the device require separate explicit authorization.
+
+System classification is unknown when package metadata is incomplete or flags are absent/empty. A system classification does not identify a critical service or prove dependency safety; a third-party classification does not imply an app is unnecessary. Shared UID absence is not proof of isolation. Special access values are snapshot facts: `None` means unknown, and AppOps `default` is not permission approval. Query `--section apps --package PACKAGE` for metadata statuses, AppOps and bounded recommendation finding samples, then query permissions, findings, evidence and coverage for the decision.
+
+| Application | System Classification | Shared UID | Special Access Snapshot | Review Prompts | Finding ID Sample | App Status |
+|---|---|---|---|---|---|---|
+{{recommendations}}
+
 ## Application Overview
 
 | Application | Status | Artifacts | Permissions | Endpoint Candidates | SDK Candidates |

@@ -40,6 +40,11 @@ SECTIONS = (
     "methods",
     "fields",
 )
+RECOMMENDATION_FINDING_SAMPLE_LIMIT = 3
+REVIEW_ACTION_LABELS = {
+    "review_static_evidence": "Inspect findings and supporting evidence",
+    "review_granted_permissions_in_system_settings": "Review granted permissions against required features",
+}
 
 
 def load_report(path):
@@ -76,8 +81,63 @@ def _application_view(app):
     )
 
 
+def installation_context(app):
+    installation = app.get("installation")
+    if installation is None:
+        return None
+    metadata_status = next(
+        (
+            item["status"]
+            for item in installation.get("stages", ())
+            if item["stage"] == "package_permissions"
+        ),
+        "UNAVAILABLE",
+    )
+    flags = installation.get("flags")
+    is_system = (
+        "SYSTEM" in flags
+        if isinstance(flags, list) and flags and metadata_status == "COMPLETE"
+        else None
+    )
+    return {
+        "user": installation.get("user", app["user"]),
+        **{
+            key: installation.get(key)
+            for key in ("uid", "app_id", "installer", "shared_user", "flags")
+        },
+        "is_system": is_system,
+        "package_metadata_status": metadata_status,
+        "appops": installation.get("appops", {}),
+        "special_access": installation.get("special_access", {}),
+        "stages": installation.get("stages", []),
+    }
+
+
+def recommendation_context(app):
+    recommendations = []
+    for item in app.get("recommendations", ()):
+        value = {key: field for key, field in item.items() if key != "finding_ids"}
+        if "finding_ids" in item:
+            identities = item["finding_ids"]
+            finding_count = len(identities)
+            value.update(
+                finding_count=finding_count,
+                finding_id_sample=list(
+                    islice(identities, RECOMMENDATION_FINDING_SAMPLE_LIMIT)
+                ),
+                finding_ids_truncated=finding_count
+                > RECOMMENDATION_FINDING_SAMPLE_LIMIT,
+            )
+        recommendations.append(value)
+    return recommendations
+
+
 def app_summary(app):
-    return _application_view(app)["summary"]
+    return {
+        **_application_view(app)["summary"],
+        "installation": installation_context(app),
+        "recommendations": recommendation_context(app),
+    }
 
 
 def summary(report, cancel=None, budget=None):
@@ -184,7 +244,11 @@ def _indexed_query(report, section, package, offset, limit, identity):
         if package and app["package"] != package:
             continue
         if section == "apps":
-            take((app_summary(app),))
+            if identity and app["id"] != identity:
+                continue
+            if offset <= total < offset + limit:
+                selected.append(app_summary(app))
+            total += 1
             continue
         owner = {"app_id": app["id"], "package": app["package"], "user": app["user"]}
         if section == "evidence":
@@ -282,6 +346,7 @@ def markdown(report, limit=100, cancel=None, budget=None):
             "sdks",
             "signals",
             "capabilities",
+            "recommendations",
         )
     }
     gap_count = 0
@@ -309,6 +374,41 @@ def markdown(report, limit=100, cancel=None, budget=None):
                 ", ".join(view["summary"]["sdk_candidates"]),
             ),
         )
+        if len(tables["recommendations"]) < limit:
+            installation = installation_context(app)
+            recommendations = recommendation_context(app)
+            system = installation["is_system"] if installation else None
+            special_access = installation["special_access"] if installation else {}
+            append(
+                "recommendations",
+                (
+                    package,
+                    "Unknown"
+                    if system is None
+                    else "System"
+                    if system
+                    else "Third-party",
+                    installation.get("shared_user") or "Unknown / not reported"
+                    if installation
+                    else "Unknown",
+                    ", ".join(
+                        f"{name}={value}"
+                        for name, value in sorted(special_access.items())
+                    )
+                    or "Unknown / not captured",
+                    "; ".join(
+                        REVIEW_ACTION_LABELS.get(item["action"], item["action"])
+                        for item in recommendations
+                    )
+                    or "No recorded review prompt; assess needs and missing context",
+                    ", ".join(
+                        identity
+                        for item in recommendations
+                        for identity in item.get("finding_id_sample", ())
+                    ),
+                    app["status"],
+                ),
+            )
         for permission in islice(
             app["permissions"], max(0, limit - len(tables["permissions"]))
         ):

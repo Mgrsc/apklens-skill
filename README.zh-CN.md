@@ -66,6 +66,7 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 - [联网引导 Skill](online-static-analysis/SKILL.md)：单文件远程引导、检出复用与移交规则。
 - [使用与参数参考](references/usage.md)：完整 CLI 参数、高级过滤、配置项与查询用法。
 - [证据与覆盖定义](references/evidence-and-coverage.md)：E0–E4 证据等级、解码与阶段状态。
+- [手机遥测屏蔽规则素材](mobile-telemetry-domains.txt)：供用户编写屏蔽规则的带注释 TXT，按服务分组，保留精确域名、域名后缀与关键词的匹配类型。
 - [隐私模型与限制](references/privacy-analysis.md)：支持的来源、传播、异步交接、查询示例及明确停止边界。
 - [用户处置建议](references/user-advice.md)：保留、限制权限、卸载或考虑停用的判断条件，以及证据、影响、恢复和未知项。
 - [实现与架构说明](references/implementation.md)：模块权责归属、流水线设计与性能考量。

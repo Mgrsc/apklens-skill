@@ -66,6 +66,7 @@ Malformed or unsupported URL literals produce located dataflow gaps while analys
 - [Online Bootstrap Skill](online-static-analysis/SKILL.md): Single-file online acquisition and handoff instructions.
 - [Usage Reference](references/usage.md): Full CLI syntax, advanced filtering, options, and query examples.
 - [Evidence and Coverage](references/evidence-and-coverage.md): E0–E4 evidence levels, decoding rules, and stage statuses.
+- [Mobile Telemetry Blocking List](mobile-telemetry-domains.txt) (Chinese): Commented domains and hostname keywords for users to write blocking rules, grouped by service with exact, suffix and keyword match types.
 - [Privacy Models and Limits](references/privacy-analysis.md): Supported sources, propagation, asynchronous handoffs, query examples and explicit stopping boundaries.
 - [User Advice](references/user-advice.md): Criteria for retaining, restricting, uninstalling or considering disabling apps, with evidence, impact, recovery and unknowns.
 - [Implementation and Performance](references/implementation.md): Component ownership, pipeline architecture, and benchmarks.

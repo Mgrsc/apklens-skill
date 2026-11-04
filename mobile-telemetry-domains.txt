@@ -1,0 +1,287 @@
+# ==============================================================================
+# 手机遥测与相关服务屏蔽规则素材 (Mobile Telemetry Domains & Rules)
+# ==============================================================================
+# 供用户按所用网络过滤工具（AdGuard Home、Pi-hole、Clash、Surge、hosts 等）
+# 的语法编写屏蔽规则；每条地址独占一行，不含协议前缀，行尾无注释。
+# 所有说明与注释均采用独立行。
+#
+# 匹配规则类型说明：
+# - domain：精确匹配主机名。
+# - domain_suffix：匹配该域名及其全部子域。
+# - domain_keyword：匹配主机名中的字面片段；不是完整域名，不能直接作为 hosts/DNS 导入。
+#
+# 规则条目统计：
+# 共 111 条（72 条精确域名、24 条域名后缀、15 条关键词），保留原始匹配类型。
+#
+# 风险与免责提示：
+# - 按需选择条目；屏蔽安全、注册、配置、分发等服务可能影响对应系统功能。
+# - “名称推断”表示用途基于域名命名推测，未获独立官方文档确认。
+# - “文档支持”表示该端点存在于公开开发文档或技术资料中。
+# - “部分子域有文档支持”不代表整个域名族均为遥测用途。
+# - “近期公开分析”表示端点来自公开的设备分析或逆向说明，本清单未复现该次取证。
+# ==============================================================================
+
+
+# ==============================================================================
+# 1. 运营商终端管理与注册
+# 说明：运营商网络终端管理与自注册端点。
+# 风险：屏蔽可能影响电信、联通或移动网络终端自注册或远程配置。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# 联通体系终端管理／注册（名称推断）
+dm.wo.com.cn
+# 中国电信终端自注册（文档支持）
+zzhc.vnet.cn
+# 中国移动终端公司设备管理／自注册（近期公开分析；域名备案主体为中国移动通信集团终端有限公司）
+a.fxltsbl.com
+
+
+# ==============================================================================
+# 2. vivo：统计、诊断、广告与其他服务
+# 说明：覆盖 vivo 系统内置服务、STSDK 埋点采集、日志、应用商店监控及海外广告服务。
+# 风险：isecure.vivo.com.cn 涉及安全服务；apk.wsdl.vivo.com.cn 可能涉及 APK 分发。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# 系统与安全服务（名称推断；用途待核实，可能影响 APK 分发或安全服务）
+apk.wsdl.vivo.com.cn
+isecure.vivo.com.cn
+
+# 日志、埋点与应用监控（名称推断）
+onelog.vivo.com
+pointsdk.vivo.com.cn
+browserreport.vivo.com.cn
+stvideoreport.vivo.com.cn
+clickmonitor.appstore.vivo.com.cn
+
+# STSDK 运行时数据采集与上报组件（名称推断）
+prt-stsdk.vivo.com.cn
+ecprivacyonrt-stsdk.vivo.com.cn
+ecprivacyort-stsdk.vivo.com.cn
+atomonrt-stsdk.vivo.com.cn
+appstoreonrt-stsdk.vivo.com.cn
+fastonrt-stsdk.vivo.com.cn
+flutteronrt-stsdk.vivo.com.cn
+ivideoonrt-stsdk.vivo.com.cn
+combineaionrt-stsdk.vivo.com.cn
+moni-onrt-stsdk.vivo.com.cn
+
+# --- 域名后缀 (domain_suffix) ---
+# STSDK 域名族（名称推断；不包含带连字符前缀的同级主机）与广告网络
+stsdk.vivo.com.cn
+adnet.vivo.com.cn
+
+# --- 关键词 (domain_keyword) ---
+# 带业务前缀的 STSDK 主机、国际服务、广告日志与异常上报（名称推断）
+-stsdk.vivo.com.cn
+stsdk.vivoglobal.com
+adlog.vivoglobal.com
+err-up.vivoglobal.com
+errup.vivoglobal.com
+trace-h5sdk.vivo.com.cn
+
+
+# ==============================================================================
+# 3. 小米／MIUI：统计、广告、安全与诊断
+# 说明：覆盖 MIUI 埋点、事件跟踪、广告分发、性能监测与安全清理组件。
+# 风险：屏蔽 flash.sec.* 或 fraud-detection.* 可能影响安全检测与风控机制。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# 安全检测、风控与数据采集接口（名称推断）
+flash.sec.miui.com
+flash.sec.intl.miui.com
+fraud-detection.engine.miui.com
+api.collect.data.intl.miui.com
+
+# 性能监测、异常诊断与数据分析（名称推断）
+apm-rum.inf.miui.com
+sentry.sec.miui.com
+sentry.pt.xiaomi.com
+sensorsdata.10046.xiaomimobile.com
+
+# 国际与区域事件跟踪（名称推断）
+# tracking.<区域>.miui.com 不是 tracking.miui.com 的子域，后缀盖不住
+tracking.intl.miui.com
+tracking.india.miui.com
+tracking.rus.miui.com
+tracking.eu.miui.com
+# 区域 MiStat（名称推断）
+# mistat.<区域>.xiaomi.com 不是 mistat.xiaomi.com 的子域；关键词 .mistat. 也匹配不到最左标签
+mistat.india.xiaomi.com
+mistat.intl.xiaomi.com
+mistat.rus.xiaomi.com
+
+# 广告接口、SDK 配置与账号访问分析（名称推断；sdkconfig.eu 未确认是广告专用配置）
+api.ad.intl.xiaomi.com
+sdkconfig.ad.intl.xiaomi.com
+sdkconfig.eu.xiaomi.com
+piwik.account.mi.com
+
+# --- 域名后缀 (domain_suffix) ---
+# MiStat 统计、MIUI 事件跟踪与大数据平台（名称推断）
+mistat.xiaomi.com
+tracking.miui.com
+
+# 广告服务、安全清理与防病毒组件（名称推断）
+ad.xiaomi.com
+xlmc.sec.miui.com
+avast.sec.miui.com
+bigdata.xiaomi.com
+
+# --- 关键词 (domain_keyword) ---
+# 任意域内的 MiStat 命名线索（名称推断；通用命名线索，不限定小米域名）
+# 片段含前导点，匹配不到最左标签就是 mistat 的主机；这类主机见上方精确域名
+.mistat.
+
+
+# ==============================================================================
+# 4. 华为／荣耀：指标、日志与数据服务
+# 说明：华为云 (HiCloud)、DBankCloud 与荣耀云的数据上报、指标采集、事件采集与日志归档服务。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# 云服务指标与统计集群（名称推断）
+metrics.data.hicloud.com
+metrics1.data.hicloud.com
+metrics2.data.hicloud.com
+metrics3.data.hicloud.com
+metrics4.data.hicloud.com
+metrics5.data.hicloud.com
+
+# 云服务日志采集与备份入口（名称推断）
+logservice.hicloud.com
+logservice1.hicloud.com
+logbak.hicloud.com
+
+# 事件采集位于 op 标签下，不在 dt 后缀内（名称推断；公开追踪列表）
+# op 命名空间同时承载广告交换，故不使用 op.dbankcloud.com 或 op.hicloud.com 整段后缀
+events-drcn.op.dbankcloud.cn
+events-drcn.op.dbankcloud.com
+events-dre.op.dbankcloud.com
+events-dra.op.hicloud.com
+events-dre.op.hicloud.com
+
+# 荣耀平台跟踪与区域日志（名称推断）
+# platform.hihonorcloud.com 同时承载广告，故不使用整段后缀
+tracking-data.platform.hihonorcloud.com
+tracking-data-drru.platform.hihonorcloud.com
+log-dra.platform.hihonorcloud.com
+log-drcn.platform.hihonorcloud.com
+log-dre.platform.hihonorcloud.com
+log-drru.platform.hihonorcloud.com
+
+# --- 域名后缀 (domain_suffix) ---
+# 华为云与荣耀云相关数据服务（名称推断）
+dt.hicloud.com
+dt.dbankcloud.cn
+dt.dbankcloud.com
+dt.dbankcloud.ru
+dt.hihonorcloud.com
+
+# --- 关键词 (domain_keyword) ---
+# DBankCloud 数据子域命名线索（名称推断；不限定顶级域或主机名结尾）
+.data.dbankcloud.
+
+
+# ==============================================================================
+# 5. OPPO／ColorOS／HeyTap：上传与广告
+# 说明：ColorOS 终端数据上传端点及 HeyTap/OPPO 广告网络域名族。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# ColorOS 数据上传（名称推断）
+moa-upload-online.coloros.com
+
+# --- 域名后缀 (domain_suffix) ---
+# HeyTap 与 OPPO 广告服务（名称推断）
+ads.heytapmobi.com
+ads.heytapmobile.com
+ads.oppomobile.com
+
+# --- 关键词 (domain_keyword) ---
+# 数据上报网关命名线索（名称推断）。同时匹配 dragate- 与 dc-dragate-，不放宽 dc.*
+dragate
+
+
+# ==============================================================================
+# 6. 三星：设备诊断与其他设备服务
+# 说明：三星设备诊断监测 (DiagMon) 策略、上报接口与 Atlas 设备服务。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# 诊断监测接口与策略配置（名称推断）
+diagmon-serviceapi.samsungdm.com
+diagmon-policy.samsungdm.com
+
+# Atlas 设备服务（待核实）
+dc.di.atlas.samsung.com
+
+
+# ==============================================================================
+# 7. 火山引擎／BytePlus／字节相关 SDK
+# 说明：DataFinder（增长分析）、AppLog、APM 日志及各区域上报端点。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# DataFinder 事件数据上报端点（官方文档支持；含广州、东南亚与海外 BytePlus 环境）
+gator.volces.com
+gator.uba.cn-guangzhou.volces.com
+gator.uba.ap-southeast-1.volces.com
+gator.uba.ap-southeast-1.bytepluses.com
+mcs.volceapplog.com
+mcs.tobsnssdk.com
+
+# --- 域名后缀 (domain_suffix) ---
+# DataFinder 与应用日志分析服务族（部分子域有官方文档支持）
+ctobsnssdk.com
+tobsnssdk.com
+volceapplog.com
+
+# --- 关键词 (domain_keyword) ---
+# 字节相关 APM 与 SDK 日志命名线索（名称推断；保留原始拼写）
+apmlog.snssdk
+toblog.ctobsnssdk
+
+
+# ==============================================================================
+# 8. 第三方统计与崩溃诊断 SDK
+# 说明：移动应用集成的常见第三方分析、崩溃追踪与事件埋点 SDK 服务族。
+# ==============================================================================
+
+# --- 域名后缀 (domain_suffix) ---
+# 友盟统计分析与友盟云服务
+umeng.com
+umengcloud.com
+
+# 腾讯 Bugly 崩溃与质量诊断服务
+bugly.qq.com
+
+# 神策数据 (Sensors Data) 用户行为分析服务
+sensorsdata.cn
+
+
+# ==============================================================================
+# 9. 机构域名、未知归属与宽泛关键词
+# 说明：未确认归属的服务端点、科研机构站点及宽泛的通配关键词。
+# 风险：谨慎屏蔽 caict.ac.cn（全站域名非遥测专用）；宽泛关键词可能误伤无关业务。
+# ==============================================================================
+
+# --- 精确域名 (domain) ---
+# 未知网关与服务端点（待核实；归属未明确确认，不按排列位置归属特定厂商）
+gateway-papa.cloud.weizhi.com
+s.mi1.cc
+# 中国信息通信研究院反诈接口（近期公开分析）。下方整段后缀还会匹配该机构的其他站点
+eps.caict.ac.cn
+
+# --- 域名后缀 (domain_suffix) ---
+# 中国信息通信研究院相关站点（整个机构域名，非遥测专用；已点名的上报主机是 eps.caict.ac.cn，谨慎屏蔽整段）
+caict.ac.cn
+
+# --- 关键词 (domain_keyword) ---
+# 通用服务、用户事件跟踪、日志与诊断监测命名线索（名称推断／待核实；宽泛关键词易误伤）
+obus-
+mdp-usertrace
+logservice-
+diagmon

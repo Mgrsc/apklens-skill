@@ -7,6 +7,7 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from functools import lru_cache
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from .dataflow import MODEL_VERSION, analyze_dataflow, evidence_path_key
 from .endpoints import EndpointCollector, host_matches
 from .manifest import analyze_manifest
 from .method_selection import MethodSelection
+from .metrics import phase
 from .privacy_models import SENSITIVE_SIGNALS
 from .rules import (
     RULE_VERSION,
@@ -71,6 +73,18 @@ TEXT_SUFFIXES = {
 NON_CANDIDATE_PREFIXES = ("META-INF/",)
 SDK_HOST_CACHE_SIZE = 4096
 CACHE_MEMORY_MULTIPLIER = 8
+ARTIFACT_EXCEPTIONS = (
+    AnalysisError,
+    OSError,
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    RuntimeError,
+    EOFError,
+    ET.ParseError,
+    struct.error,
+)
 
 
 def cache_key(identity, limits, mode):
@@ -191,7 +205,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
             signal_ids.add(signal["id"])
             result["signals"].append(signal)
 
-    def consume(value, source, references=None):
+    def consume(value, source, references=None, network_context=False):
         budget.check()
         if len(value.encode("utf-8", "replace")) > limits.max_string_bytes:
             stages.append(
@@ -203,7 +217,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                 )
             )
             return
-        collector.add_text(value, source, references)
+        collector.add_text(value, source, references, network_context)
         add_signals(value, source)
 
     try:
@@ -331,6 +345,8 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                                             "node_index": index,
                                             "attribute": key,
                                         },
+                                        network_context=node["name"] == "domain"
+                                        and key == "text",
                                     )
                     elif kind == "dex":
                         result["statistics"]["dex_files"] += 1
@@ -503,6 +519,8 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                                             "node_index": node_index,
                                             "attribute": key,
                                         },
+                                        network_context=node["name"] == "domain"
+                                        and key == "text",
                                     )
                     else:
                         if data.startswith((b"PK\x03\x04", b"\x1f\x8b")):
@@ -744,14 +762,11 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     stages.append(
         stage(
             "endpoint_extraction",
-            "PARTIAL"
-            if collector.truncated or collector.evidence_truncated
-            else "COMPLETE",
+            "PARTIAL" if collector.partial else "COMPLETE",
             identity,
-            "Endpoint or evidence count exceeds the budget"
-            if collector.truncated or collector.evidence_truncated
-            else None,
+            collector.coverage_reason(),
             results=len(result["endpoints"]),
+            candidate_selection=collector.candidate_summary(),
         )
     )
     stages.append(
@@ -839,6 +854,41 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     return result
 
 
+def artifact_failure(artifact, error):
+    return {
+        "sha256": artifact["sha256"],
+        "manifest": None,
+        "endpoints": [],
+        "signals": [],
+        "sdks": [],
+        "stages": [
+            stage(
+                "artifact_analysis",
+                "CANCELLED"
+                if isinstance(error, Cancelled)
+                else "PARTIAL"
+                if isinstance(error, BudgetExceeded)
+                else "FAILED",
+                artifact["sha256"],
+                f"{type(error).__name__}: {error}",
+            )
+        ],
+        "cache": {"hit": False},
+        "statistics": {},
+        "resource_limited": isinstance(error, MemoryBudgetExceeded),
+    }
+
+
+def timed_artifact(artifact, limits, mode, cancel, cache_directory):
+    started = time.perf_counter()
+    cpu = time.thread_time()
+    result = analyze_artifact(artifact, limits, mode, cancel, cache_directory)
+    return result, {
+        "wall_seconds": time.perf_counter() - started,
+        "cpu_seconds": time.thread_time() - cpu,
+    }
+
+
 def analyze_many(
     artifacts,
     limits,
@@ -851,6 +901,8 @@ def analyze_many(
     resume_store=None,
     retry_incomplete=False,
     source_tool=None,
+    metrics=None,
+    executor_kind="thread",
 ):
     unique = {artifact["sha256"]: artifact for artifact in artifacts}
     pending = iter(sorted(unique.values(), key=lambda artifact: artifact["sha256"]))
@@ -864,6 +916,21 @@ def analyze_many(
         status = artifact_status(result)
         counts[status.lower()] += 1
         done += 1
+        if metrics is not None:
+            metrics.increment(
+                checkpoint_reused=int(resumed),
+                cache_hits=int(not resumed and result["cache"]["hit"]),
+                artifacts_completed=1,
+            )
+            metrics.artifact(
+                artifact["sha256"],
+                {
+                    "status": status,
+                    "resumed": resumed,
+                    "cache_hit": result["cache"]["hit"],
+                    "statistics": result.get("statistics", {}),
+                },
+            )
         progress(
             {
                 "event": "artifact_complete",
@@ -878,85 +945,95 @@ def analyze_many(
             }
         )
 
-    with ThreadPoolExecutor(max_workers=jobs) as executor:
-        try:
-            while True:
-                while not cancel.is_set() and len(active) < jobs:
-                    artifact = next(pending, None)
-                    if artifact is None:
-                        break
-                    if resume_store and resume_store.reusable(
-                        artifact["sha256"],
-                        cache_key(artifact["sha256"], limits, mode),
-                        retry_incomplete,
-                        source_tool,
-                    ):
-                        store.import_artifact(resume_store, artifact["sha256"])
-                        record_completion(
-                            artifact, results[artifact["sha256"]], resumed=True
-                        )
-                        continue
-                    active[
-                        executor.submit(
-                            analyze_artifact,
-                            artifact,
-                            limits,
-                            mode,
-                            cancel,
-                            cache_directory,
-                        )
-                    ] = artifact
-                if not active:
+    if executor_kind == "process":
+        from .workers import analyze_processes
+
+        if store is None:
+            raise AnalysisError("Process analysis requires a persistent task store")
+
+        def unparsed():
+            for artifact in pending:
+                if cancel.is_set():
                     break
-                completed, _ = wait(active, timeout=0.2, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    artifact = active.pop(future)
-                    try:
-                        result = future.result()
-                    except (
-                        AnalysisError,
-                        OSError,
-                        ValueError,
-                        TypeError,
-                        KeyError,
-                        IndexError,
-                        RuntimeError,
-                        EOFError,
-                        ET.ParseError,
-                        struct.error,
-                    ) as error:
-                        result = {
-                            "sha256": artifact["sha256"],
-                            "manifest": None,
-                            "endpoints": [],
-                            "signals": [],
-                            "sdks": [],
-                            "stages": [
-                                stage(
-                                    "artifact_analysis",
-                                    "CANCELLED"
-                                    if isinstance(error, Cancelled)
-                                    else "PARTIAL"
-                                    if isinstance(error, BudgetExceeded)
-                                    else "FAILED",
-                                    artifact["sha256"],
-                                    f"{type(error).__name__}: {error}",
-                                )
-                            ],
-                            "cache": {"hit": False},
-                            "statistics": {},
-                            "resource_limited": isinstance(error, MemoryBudgetExceeded),
-                        }
-                    if result.get("resource_limited"):
-                        cancel.set()
-                    results[artifact["sha256"]] = result
-                    record_completion(artifact, result)
-                    del result
-        except BaseException:
-            cancel.set()
-            for future in active:
-                future.cancel()
-            raise
+                if resume_store and resume_store.reusable(
+                    artifact["sha256"],
+                    cache_key(artifact["sha256"], limits, mode),
+                    retry_incomplete,
+                    source_tool,
+                ):
+                    with phase(metrics, "checkpoint_import"):
+                        store.import_artifact(resume_store, artifact["sha256"])
+                    record_completion(
+                        artifact, results[artifact["sha256"]], resumed=True
+                    )
+                else:
+                    yield artifact
+
+        analyze_processes(
+            iter(unparsed()),
+            limits,
+            mode,
+            cancel,
+            jobs,
+            cache_directory,
+            store,
+            record_completion,
+            metrics,
+        )
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            try:
+                while True:
+                    while not cancel.is_set() and len(active) < jobs:
+                        artifact = next(pending, None)
+                        if artifact is None:
+                            break
+                        if resume_store and resume_store.reusable(
+                            artifact["sha256"],
+                            cache_key(artifact["sha256"], limits, mode),
+                            retry_incomplete,
+                            source_tool,
+                        ):
+                            with phase(metrics, "checkpoint_import"):
+                                store.import_artifact(resume_store, artifact["sha256"])
+                            record_completion(
+                                artifact, results[artifact["sha256"]], resumed=True
+                            )
+                            continue
+                        active[
+                            executor.submit(
+                                timed_artifact,
+                                artifact,
+                                limits,
+                                mode,
+                                cancel,
+                                cache_directory,
+                            )
+                        ] = artifact
+                    if not active:
+                        break
+                    completed, _ = wait(
+                        active, timeout=0.2, return_when=FIRST_COMPLETED
+                    )
+                    for future in completed:
+                        artifact = active.pop(future)
+                        try:
+                            result, timings = future.result()
+                            if metrics is not None:
+                                metrics.record("artifact_parse", **timings)
+                        except ARTIFACT_EXCEPTIONS as error:
+                            result = artifact_failure(artifact, error)
+                        if result.get("resource_limited"):
+                            cancel.set()
+                        with phase(metrics, "artifact_persist"):
+                            results[artifact["sha256"]] = result
+                        record_completion(artifact, result)
+                        del result
+            except BaseException:
+                cancel.set()
+                for future in active:
+                    future.cancel()
+                raise
     for identity in unique.keys() - results.keys():
         results[identity] = {
             "sha256": identity,
@@ -1036,18 +1113,15 @@ def source_view(artifact, output, executable, limits, cancel):
                 stage(
                     "source_view",
                     "PARTIAL"
-                    if collector.truncated
-                    or collector.evidence_truncated
-                    or result["status"] != "COMPLETE"
+                    if collector.partial or result["status"] != "COMPLETE"
                     else "COMPLETE",
                     artifact["sha256"],
                     "Source output or endpoint evidence is partial"
-                    if collector.truncated
-                    or collector.evidence_truncated
-                    or result["status"] != "COMPLETE"
+                    if collector.partial or result["status"] != "COMPLETE"
                     else None,
                     files=files,
                     bytes=total_bytes,
+                    candidate_selection=collector.candidate_summary(),
                 )
             )
         else:
@@ -1104,6 +1178,12 @@ def merge_records(records, limits):
 
 
 def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=None):
+    transaction = store.transaction() if store else nullcontext()
+    with transaction:
+        return _build_apps(artifacts, results, snapshot, limits, mode, store, progress)
+
+
+def _build_apps(artifacts, results, snapshot, limits, mode, store, progress):
     groups = {}
     for artifact in artifacts:
         if store:
@@ -1317,14 +1397,15 @@ def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=
                 for name in ("method_dataflow_E3", "interprocedural_dataflow_E4")
             )
         else:
-            flows, coverage = analyze_dataflow(
-                app["methods"],
-                limits,
-                store.cancel if store else None,
-                definition_summaries=(
-                    results[item["sha256"]] for item in group["artifacts"]
-                ),
-            )
+            with phase(store.metrics if store else None, "dataflow"):
+                flows, coverage = analyze_dataflow(
+                    app["methods"],
+                    limits,
+                    store.cancel if store else None,
+                    definition_summaries=(
+                        results[item["sha256"]] for item in group["artifacts"]
+                    ),
+                )
             app["findings"].extend(flows)
             app["coverage"].extend(coverage)
         build_findings(app, store)

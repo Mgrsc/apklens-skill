@@ -20,6 +20,7 @@ analysis.sqlite3-wal
 analysis.sqlite3-shm
 snapshot.json
 progress.json
+performance.json
 summary.json
 report.md
 assessment.json

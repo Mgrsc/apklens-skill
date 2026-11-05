@@ -1,7 +1,10 @@
+import errno
 import hashlib
 import json
 import os
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,10 +17,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MEMORY_SAMPLE_SECONDS = 0.1
+DISK_BUDGET_SAMPLE_SECONDS = 1.0
 MEMORY_BUDGET_MESSAGE = "Process memory exceeds the cooperative memory budget"
 JSON_BUFFER_CHARACTERS = 64 * 1024
 JSON_READ_BYTES = 1024 * 1024
+JSON_RECORD_CHARACTERS = 1024 * 1024
+JSON_RECORD_ITEMS = 16384
+JSON_SCALAR_CHARACTERS = 64
 CHECKSUM_CHECK_INTERVAL = 1024
+LINK_UNSUPPORTED_ERRORS = {
+    errno.EXDEV,
+    errno.EPERM,
+    errno.EOPNOTSUPP,
+    errno.ENOSYS,
+    errno.EMLINK,
+}
 _memory_sample = (0.0, None)
 
 
@@ -34,6 +48,33 @@ def resident_bytes():
         value = None
     _memory_sample = (now, value)
     return value
+
+
+def process_tree_rss(pid=None):
+    pending = [os.getpid() if pid is None else pid]
+    visited = set()
+    total = 0
+    observed = False
+    while pending:
+        current = pending.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        try:
+            total += int(
+                Path(f"/proc/{current}/statm").read_text().split()[1]
+            ) * os.sysconf("SC_PAGE_SIZE")
+            observed = True
+            for task in Path(f"/proc/{current}/task").iterdir():
+                try:
+                    pending.extend(
+                        int(item) for item in (task / "children").read_text().split()
+                    )
+                except (OSError, ValueError):
+                    continue
+        except (OSError, ValueError, IndexError, AttributeError):
+            continue
+    return total if observed else None
 
 
 def available_memory():
@@ -100,6 +141,10 @@ class MemoryBudgetExceeded(BudgetExceeded):
     pass
 
 
+class DiskBudgetExceeded(BudgetExceeded):
+    pass
+
+
 def check_resources(cancel=None, budget=None):
     if cancel is not None and cancel.is_set():
         raise Cancelled("Analysis cancelled")
@@ -115,19 +160,51 @@ def check_memory(memory_bytes):
 
 
 class TaskBudget:
-    def __init__(self, limits, cancel):
+    def __init__(
+        self, limits, cancel, disk_path=None, min_free_bytes=0, process_tree=False
+    ):
         self.limits = limits
         self.cancel = cancel
         self.memory_exceeded = False
+        self.disk_exceeded = False
+        self.disk_path = disk_path
+        self.min_free_bytes = min_free_bytes
+        self.next_disk_check = 0.0
+        self.process_tree = process_tree
+        self.next_memory_check = 0.0
 
     def check(self):
         check_resources(self.cancel)
         try:
-            check_memory(self.limits.memory_bytes)
+            if self.process_tree:
+                if time.monotonic() >= self.next_memory_check:
+                    self.next_memory_check = time.monotonic() + MEMORY_SAMPLE_SECONDS
+                    usage = process_tree_rss()
+                    if usage is None:
+                        raise AnalysisError(
+                            "Process tree memory sampling is unavailable"
+                        )
+                    if self.limits.memory_bytes and usage > self.limits.memory_bytes:
+                        raise MemoryBudgetExceeded(
+                            "Task process tree exceeds the cooperative memory budget"
+                        )
+            else:
+                check_memory(self.limits.memory_bytes)
         except MemoryBudgetExceeded:
             self.memory_exceeded = True
             self.cancel.set()
             raise
+        self.check_disk()
+
+    def check_disk(self):
+        if self.disk_path is not None and time.monotonic() >= self.next_disk_check:
+            self.next_disk_check = time.monotonic() + DISK_BUDGET_SAMPLE_SECONDS
+            if shutil.disk_usage(self.disk_path).free < self.min_free_bytes:
+                self.disk_exceeded = True
+                self.cancel.set()
+                raise DiskBudgetExceeded(
+                    "Available disk space fell below the task safety reserve"
+                )
 
 
 @dataclass(frozen=True)
@@ -232,8 +309,9 @@ def atomic_text(path, value, cancel=None, budget=None):
 
 
 class JsonRecords(Sequence):
-    def __init__(self, values):
+    def __init__(self, values, bounded=False):
         self.values = values
+        self.bounded = bounded
 
     def __len__(self):
         return len(self.values)
@@ -243,6 +321,65 @@ class JsonRecords(Sequence):
 
     def __iter__(self):
         return iter(self.values)
+
+
+class JsonRecordMapping(Mapping):
+    def __init__(self, values):
+        self.values = values
+
+    def __len__(self):
+        return len(self.values)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __getitem__(self, key):
+        return self.values[key]
+
+
+def bounded_record(value, cancel=None):
+    pending = [value]
+    characters = 0
+    items = 0
+    while pending:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("Report export cancelled")
+        current = pending.pop()
+        items += 1
+        if type(current) is dict:
+            if items + len(pending) + 2 * len(current) > JSON_RECORD_ITEMS:
+                return False
+            pending.extend(current.keys())
+            pending.extend(current.values())
+        elif type(current) in (list, tuple):
+            if items + len(pending) + len(current) > JSON_RECORD_ITEMS:
+                return False
+            pending.extend(current)
+        elif type(current) is str:
+            characters += len(current) * 6
+        elif type(current) in (int, float, bool, type(None)):
+            characters += JSON_SCALAR_CHARACTERS
+        else:
+            return False
+        if (
+            characters > JSON_RECORD_CHARACTERS
+            or items + len(pending) > JSON_RECORD_ITEMS
+        ):
+            return False
+    return True
+
+
+def record_chunks(value, cancel=None):
+    if bounded_record(value, cancel):
+        yield json.dumps(
+            value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        )
+    else:
+        if type(value) is dict:
+            value = JsonRecordMapping(value)
+        elif type(value) in (list, tuple):
+            value = JsonRecords(value, bounded=True)
+        yield from json_chunks(value, cancel)
 
 
 def json_chunks(value, cancel=None):
@@ -255,7 +392,10 @@ def json_chunks(value, cancel=None):
             yield separator
             yield json.dumps(key, ensure_ascii=False)
             yield ":"
-            yield from json_chunks(item, cancel)
+            if isinstance(value, JsonRecordMapping):
+                yield from record_chunks(item, cancel)
+            else:
+                yield from json_chunks(item, cancel)
             separator = ","
         yield "}"
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -266,9 +406,12 @@ def json_chunks(value, cancel=None):
                 raise Cancelled("Report export cancelled")
             yield separator
             if isinstance(value, JsonRecords):
-                yield json.dumps(
-                    item, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-                )
+                if getattr(value, "bounded", False):
+                    yield from record_chunks(item, cancel)
+                else:
+                    yield json.dumps(
+                        item, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                    )
             else:
                 yield from json_chunks(item, cancel)
             separator = ","
@@ -338,7 +481,9 @@ def snapshot_file(source, directory, limits, cancel):
     try:
         with (
             source.open("rb") as incoming,
-            tempfile.NamedTemporaryFile(dir=directory, delete=False) as outgoing,
+            tempfile.NamedTemporaryFile(
+                dir=directory, suffix=".apk", delete=False
+            ) as outgoing,
         ):
             temporary = Path(outgoing.name)
             before = os.fstat(incoming.fileno())
@@ -360,7 +505,11 @@ def snapshot_file(source, directory, limits, cancel):
                 raise AnalysisError("APK changed while it was being collected")
         identity = digest.hexdigest()
         destination = directory / f"{identity}.apk"
-        os.replace(temporary, destination)
+        destination = publish_snapshot(
+            temporary, destination, identity, size, limits, cancel
+        )
+        if destination == temporary:
+            temporary = None
         return {
             "sha256": identity,
             "size": size,
@@ -370,6 +519,115 @@ def snapshot_file(source, directory, limits, cancel):
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def file_identity(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def hash_regular_file(source, limits, cancel):
+    before_path = source.lstat()
+    if not stat.S_ISREG(before_path.st_mode):
+        raise AnalysisError("Collected APK is not a regular private file")
+    descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as incoming:
+        before = os.fstat(incoming.fileno())
+        if file_identity(before) != file_identity(before_path):
+            raise AnalysisError("Collected APK changed before hashing")
+        if before.st_size > limits.max_apk_bytes:
+            raise BudgetExceeded("APK exceeds the input size budget")
+        digest = hashlib.sha256()
+        size = 0
+        check_resources(cancel)
+        while chunk := incoming.read(JSON_READ_BYTES):
+            check_resources(cancel)
+            size += len(chunk)
+            if size > limits.max_apk_bytes:
+                raise BudgetExceeded("APK exceeds the input size budget")
+            digest.update(chunk)
+        after = os.fstat(incoming.fileno())
+    if (
+        size != before.st_size
+        or file_identity(before) != file_identity(after)
+        or file_identity(after) != file_identity(source.lstat())
+    ):
+        raise AnalysisError("Collected APK changed while hashing")
+    return digest.hexdigest(), size, after
+
+
+def validate_snapshot(path, identity, size, limits, cancel):
+    actual, actual_size, _ = hash_regular_file(path, limits, cancel)
+    if (actual, actual_size) != (identity, size):
+        raise AnalysisError("Existing content-addressed APK failed validation")
+
+
+def publish_snapshot(source, destination, identity, size, limits, cancel):
+    check_resources(cancel)
+    before = source.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise AnalysisError("Collected APK is not a regular private file")
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        validate_snapshot(destination, identity, size, limits, cancel)
+        return destination
+    except NotImplementedError:
+        return source
+    except OSError as error:
+        if error.errno not in LINK_UNSUPPORTED_ERRORS:
+            raise
+        return source
+    after = destination.lstat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        destination.unlink()
+        raise AnalysisError("Collected APK changed during publication")
+    return destination
+
+
+def publish_collected_file(source, directory, limits, cancel, metrics=None):
+    from .metrics import phase
+
+    source, directory = Path(source), Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with phase(metrics, "collection_hash"):
+        identity, size, observed = hash_regular_file(source, limits, cancel)
+    if metrics:
+        metrics.increment(collection_hashed_bytes=size)
+    if file_identity(source.lstat()) != file_identity(observed):
+        raise AnalysisError("Collected APK changed before publication")
+    with phase(metrics, "collection_publish"):
+        destination = publish_snapshot(
+            source, directory / f"{identity}.apk", identity, size, limits, cancel
+        )
+    if destination == source:
+        with phase(metrics, "collection_copy"):
+            result = snapshot_file(source, directory, limits, cancel)
+        if result["sha256"] != identity or result["size"] != size:
+            raise AnalysisError("Collected APK changed during fallback copying")
+        if metrics:
+            metrics.increment(
+                collection_copied_bytes=size, collection_hashed_bytes=size
+            )
+        return result
+    if metrics:
+        metrics.increment(collection_copied_bytes=0)
+    return {
+        "sha256": identity,
+        "size": size,
+        "path": str(destination),
+        "input": str(source),
+    }
 
 
 def run_command(

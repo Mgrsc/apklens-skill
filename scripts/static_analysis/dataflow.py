@@ -57,8 +57,36 @@ URL_SCHEMES = NETWORK_URL_SCHEMES | {"file"}
 TYPE_PATTERN = re.compile(r"\[*L[^;]+;|\[*[ZBCSIJFD]")
 
 
+def immutable_content(value):
+    return (
+        type(value) in (str, int, float, bool, type(None))
+        or isinstance(value, ImmutableLeaf)
+        and value._immutable
+        or type(value) is tuple
+        and all(immutable_content(item) for item in value)
+    )
+
+
+class ImmutableLeaf:
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "_immutable",
+            all(immutable_content(value) for value in vars(self).values()),
+        )
+
+    def __deepcopy__(self, memo):
+        if self._immutable:
+            return self
+        result = object.__new__(type(self))
+        memo[id(self)] = result
+        for key, value in vars(self).items():
+            object.__setattr__(result, key, copy.deepcopy(value, memo))
+        return result
+
+
 @dataclass(frozen=True)
-class Node:
+class Node(ImmutableLeaf):
     artifact: str
     entry: str
     method: str
@@ -85,13 +113,13 @@ class Node:
 
 
 @dataclass(frozen=True)
-class Source:
+class Source(ImmutableLeaf):
     category: str
     path: tuple
 
 
 @dataclass(frozen=True)
-class Value:
+class Value(ImmutableLeaf):
     sources: tuple = ()
     objects: tuple = ()
     constants: tuple = ()
@@ -144,9 +172,6 @@ class Analyzer:
         self.method_cache_bytes = 0
 
     def gap(self, reason, node=None):
-        source = node.record() if node else {}
-        if node is not None and self.active_root:
-            source["candidate_root"] = self.active_root
         group = reason.split(": ", 1)[0]
         if (
             group not in self.gap_counts
@@ -154,14 +179,17 @@ class Analyzer:
         ):
             group = "Additional reason groups exceed the summary budget"
         self.gap_counts[group] += 1
-        identity = stable_id("flow_gap", reason, source)
-        if len(self.gaps) < MAX_GAPS:
-            self.gaps[identity] = {**source, "id": identity, "reason": reason}
-        else:
+        if len(self.gaps) >= MAX_GAPS:
             self.gaps["truncated"] = {
                 "id": "truncated",
                 "reason": "Additional dataflow gaps exceed the display budget",
             }
+            return
+        source = node.record() if node else {}
+        if node is not None and self.active_root:
+            source["candidate_root"] = self.active_root
+        identity = stable_id("flow_gap", reason, source)
+        self.gaps[identity] = {**source, "id": identity, "reason": reason}
 
     def join(self, *values):
         sources, objects = [], []

@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from support import legacy_store_layout
+
 from scripts.static_analysis.common import json_chunks, stage
 from scripts.static_analysis.reports import (
     close_report,
@@ -216,10 +218,7 @@ class UserAdviceTests(unittest.TestCase):
                 path = self.root / f"version-{version}.sqlite3"
                 connection = sqlite3.connect(path)
                 store.connection.backup(connection)
-                connection.execute(
-                    "UPDATE metadata SET payload=? WHERE key='store_version'",
-                    (str(version),),
-                )
+                legacy_store_layout(connection, version)
                 if version == 1:
                     connection.execute(
                         "DELETE FROM metadata WHERE key LIKE 'app_view:%'"

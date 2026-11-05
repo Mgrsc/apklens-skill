@@ -3,17 +3,48 @@ import binascii
 import html
 import ipaddress
 import re
+from collections import Counter
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .common import stable_id
 
 URL_PATTERN = re.compile(r"(?i)\b(?:https?|wss?|mqtts?|tcp|tls|udp)://[^\s<>\"'`\\]+")
 RELATIVE_PATTERN = re.compile(
-    r"(?<![:\w/])//(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}(?::[0-9]{1,5})?(?:/[^\s<>\"'`\\]*)?"
+    r"(?<![:\w/])//(?:\[[0-9A-Fa-f:.%A-Za-z_-]+\]|(?:[^\W_][\w-]*\.)+[^\W_][\w-]*)(?::[0-9]{1,5})?(?:/[^\s<>\"'`\\]*)?"
 )
 DOMAIN_PATTERN = re.compile(
-    r"(?<![\w@./-])(?:(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)\.)+(?:[A-Za-z]{2,63}|xn--[A-Za-z0-9-]+)(?![\w.-])"
+    r"(?<![\w@./-])(?:[^\W_](?:[^\W_]|-){0,62}\.)+(?:[^\W\d_]{1,63}|xn--[A-Za-z0-9-]+)(?![\w.-])"
 )
+IPV4_PATTERN = re.compile(r"(?<![\w.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\w.])")
+IPV6_PATTERN = re.compile(
+    r"(?<![\w:])[0-9A-Fa-f]*:[0-9A-Fa-f:]+(?:%[A-Za-z0-9_.-]+)?(?![\w:])"
+)
+HOST_CONTEXT_PATTERN = re.compile(
+    r"(?i)(?:^|[^\w])(?:host(?:name)?|server|endpoint|base[_-]?url|domain|dns|proxy|url|uri|origin|address)[\"']?\s*[:=]\s*[\"']?\s*$"
+)
+HOST_ATTRIBUTES = {
+    "host",
+    "hostname",
+    "server",
+    "endpoint",
+    "domain",
+    "url",
+    "uri",
+    "address",
+}
+LOW_CONFIDENCE_SAMPLE_LIMIT = 32
+LOW_CONFIDENCE_EXCERPT_CHARACTERS = 256
+SOURCE_KINDS = {
+    "manifest",
+    "xml",
+    "binary_xml",
+    "resources",
+    "dex_string",
+    "dex_raw_fallback",
+    "native_strings",
+    "asset_strings",
+    "decompiled_source",
+}
 TELEMETRY_PATH = re.compile(
     r"(?i)(?:^|[/_.-])(report|upload|collect|track|tracking|analytics|telemetry|beacon|metrics|events?|logs?|crash)(?:$|[/_.-])"
 )
@@ -22,24 +53,6 @@ COMMAND_PATH = re.compile(
 )
 ESCAPE_PATTERN = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|(/))")
 BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/_-]{16,8192}={0,2}\Z")
-SOURCE_SUFFIXES = {
-    "java",
-    "kt",
-    "class",
-    "dex",
-    "xml",
-    "json",
-    "html",
-    "js",
-    "png",
-    "jpg",
-    "so",
-    "zip",
-    "apk",
-    "txt",
-    "properties",
-    "proto",
-}
 MATCH_BUDGET_INTERVAL = 256
 NETWORK_SCHEMES = {"http", "https", "ws", "wss", "mqtt", "mqtts", "tcp", "tls", "udp"}
 
@@ -90,7 +103,7 @@ def normalize_endpoint(value, kind="url"):
         }
     if kind == "domain":
         host = host_normalize(raw)
-        if not host or "." not in host or host.rsplit(".", 1)[-1] in SOURCE_SUFFIXES:
+        if not host or "." not in host:
             return None
         return {
             "kind": kind,
@@ -98,6 +111,18 @@ def normalize_endpoint(value, kind="url"):
             "host": host,
             "tags": [],
             "reason": "Bare domain candidate; network use is unproven",
+        }
+    if kind == "ip":
+        try:
+            host = str(ipaddress.ip_address(raw))
+        except ValueError:
+            return None
+        return {
+            "kind": "ip",
+            "value": host,
+            "host": host,
+            "tags": [],
+            "reason": "IP literal candidate; network use is unproven",
         }
     try:
         parsed = urlsplit("https:" + raw if kind == "scheme_relative" else raw)
@@ -185,8 +210,81 @@ class EndpointCollector:
         self.items = {}
         self.truncated = False
         self.evidence_truncated = False
+        self.observed = Counter()
+        self.by_source = {}
+        self.dropped = Counter()
+        self.contextual = {}
+        self.samples = []
+        self.evicted_contextual = 0
 
-    def add_text(self, value, source, references=None):
+    def _source_kind(self, source):
+        kind = source.get("kind", "unknown")
+        return kind if kind in SOURCE_KINDS else "other"
+
+    def _observe(self, classification, source):
+        self.observed[classification] += 1
+        self.by_source.setdefault(self._source_kind(source), Counter())[
+            classification
+        ] += 1
+
+    def _evidence(self, source, match, transforms, excerpt_limit=2048):
+        raw = match.group()
+        return {
+            **source,
+            "character_offset": match.start(),
+            "transforms": transforms,
+            "excerpt": raw[:excerpt_limit],
+            "id": stable_id("evidence", source, match.start(), transforms, raw),
+        }
+
+    def _low_confidence(self, source, match, transforms):
+        self._observe("low_confidence", source)
+        if (
+            len(self.samples)
+            >= min(LOW_CONFIDENCE_SAMPLE_LIMIT, self.limits.max_results)
+            or len(self.samples) + len(self.items) >= self.limits.max_results
+        ):
+            return
+        self.samples.append(
+            {
+                "value": match.group()[:LOW_CONFIDENCE_EXCERPT_CHARACTERS],
+                "classification": "low_confidence",
+                "reason": "Dotted token without explicit network context; intent is unknown",
+                "evidence": self._evidence(
+                    source, match, transforms, LOW_CONFIDENCE_EXCERPT_CHARACTERS
+                ),
+            }
+        )
+
+    def _admit(self, endpoint, classification):
+        key = (endpoint["kind"], endpoint["value"])
+        if key in self.items:
+            return self.items[key]
+        if len(self.items) + len(self.samples) >= self.limits.max_results:
+            if self.samples:
+                self.samples.pop()
+            elif classification != "contextual_host" and self.contextual:
+                removed, _ = self.contextual.popitem()
+                del self.items[removed]
+                self.truncated = True
+                self.evicted_contextual += 1
+            else:
+                self.truncated = True
+                self.dropped[classification] += 1
+                return None
+        record = {
+            **endpoint,
+            "id": stable_id("endpoint", *key),
+            "candidate_class": classification,
+            "evidence_level": "E1",
+            "evidence": [],
+        }
+        self.items[key] = record
+        if classification == "contextual_host":
+            self.contextual[key] = None
+        return record
+
+    def add_text(self, value, source, references=None, network_context=False):
         if not any(
             marker in value for marker in (".", ":", "\\", "%", "&")
         ) and not BASE64_PATTERN.fullmatch(value):
@@ -196,52 +294,59 @@ class EndpointCollector:
             for kind, pattern in (
                 ("url", URL_PATTERN),
                 ("scheme_relative", RELATIVE_PATTERN),
+                ("ip", IPV4_PATTERN),
+                ("ip", IPV6_PATTERN),
                 ("domain", DOMAIN_PATTERN),
             ):
-                if kind == "domain":
-                    occupied.sort()
-                    occupied_index = 0
-                    occupied_end = 0
+                occupied.sort()
+                occupied_index = 0
+                occupied_end = 0
+                spans = []
                 for index, match in enumerate(pattern.finditer(decoded)):
                     if self.budget is not None and index % MATCH_BUDGET_INTERVAL == 0:
                         self.budget.check()
+                    while (
+                        occupied_index < len(occupied)
+                        and occupied[occupied_index][0] <= match.start()
+                    ):
+                        occupied_end = max(occupied_end, occupied[occupied_index][1])
+                        occupied_index += 1
+                    if match.start() < occupied_end:
+                        continue
                     if kind == "domain":
-                        while (
-                            occupied_index < len(occupied)
-                            and occupied[occupied_index][0] <= match.start()
-                        ):
-                            occupied_end = max(
-                                occupied_end, occupied[occupied_index][1]
+                        attribute = (
+                            source.get("attribute", "").rsplit("}", 1)[-1].lower()
+                        )
+                        if (
+                            not network_context
+                            and attribute not in HOST_ATTRIBUTES
+                            and not HOST_CONTEXT_PATTERN.search(
+                                decoded[max(0, match.start() - 96) : match.start()]
                             )
-                            occupied_index += 1
-                        if match.start() < occupied_end:
+                        ):
+                            self._low_confidence(source, match, transforms)
                             continue
+                        classification = "contextual_host"
+                    else:
+                        classification = (
+                            "ip_literal" if kind == "ip" else "explicit_url"
+                        )
+                    if kind in {"url", "scheme_relative"}:
+                        spans.append(match.span())
                     endpoint = normalize_endpoint(match.group(), kind)
                     if endpoint is None:
                         continue
-                    if kind != "domain":
-                        occupied.append(match.span())
-                    key = (endpoint["kind"], endpoint["value"])
-                    if key not in self.items:
-                        if len(self.items) >= self.limits.max_results:
-                            self.truncated = True
-                            continue
-                        self.items[key] = {
-                            **endpoint,
-                            "id": stable_id("endpoint", *key),
-                            "evidence_level": "E1",
-                            "evidence": [],
-                        }
-                    record = self.items[key]
-                    evidence = {
-                        **source,
-                        "character_offset": match.start(),
-                        "transforms": transforms,
-                        "excerpt": match.group()[:2048],
-                    }
-                    evidence["id"] = stable_id(
-                        "evidence", source, match.start(), transforms, match.group()
-                    )
+                    if classification == "contextual_host":
+                        endpoint["reason"] = (
+                            "Host with explicit network context; network use is unproven"
+                        )
+                    if kind == "ip":
+                        spans.append(match.span())
+                    self._observe(classification, source)
+                    record = self._admit(endpoint, classification)
+                    if record is None:
+                        continue
+                    evidence = self._evidence(source, match, transforms)
                     if len(record["evidence"]) < self.limits.max_evidence:
                         if evidence["id"] not in {
                             item["id"] for item in record["evidence"]
@@ -267,6 +372,45 @@ class EndpointCollector:
                                     record["evidence"].append(linked)
                             else:
                                 self.evidence_truncated = True
+                occupied.extend(spans)
+
+    @property
+    def partial(self):
+        return (
+            self.truncated
+            or self.evidence_truncated
+            or self.observed["low_confidence"] > len(self.samples)
+        )
+
+    def candidate_summary(self):
+        return {
+            "policy_version": 1,
+            "unit": "match_occurrence",
+            "observed_occurrences": dict(self.observed),
+            "by_source": {
+                key: dict(value) for key, value in sorted(self.by_source.items())
+            },
+            "retained_records": dict(
+                Counter(value["candidate_class"] for value in self.items.values())
+            ),
+            "dropped_network_occurrences": dict(self.dropped),
+            "evicted_contextual_records": self.evicted_contextual,
+            "low_confidence_sample_count": len(self.samples),
+            "low_confidence_samples_truncated": self.observed["low_confidence"]
+            > len(self.samples),
+            "low_confidence_samples": self.samples,
+            "meaning": "Endpoints contain explicit locators or contextual hosts; bare dotted tokens remain unknown and are summarized with bounded samples, not reported as absent risks",
+        }
+
+    def coverage_reason(self):
+        reasons = []
+        if self.truncated or self.evidence_truncated:
+            reasons.append("Network candidate or evidence count exceeds the budget")
+        if self.observed["low_confidence"] > len(self.samples):
+            reasons.append(
+                "Low-confidence dotted tokens exceed bounded provenance samples; network intent remains unknown"
+            )
+        return "; ".join(reasons) or None
 
     def results(self):
         return sorted(

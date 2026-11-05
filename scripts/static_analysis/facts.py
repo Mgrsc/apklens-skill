@@ -55,10 +55,24 @@ def application_facts(app, signals):
     artifacts = {}
     dataflow = {}
     body_selection = []
+    endpoint_selection = []
     for item in app.get("coverage", ()):
         if item.get("artifact"):
             artifacts.setdefault(item["artifact"], set()).add(item["status"])
         metrics = item.get("metrics", {})
+        if "candidate_selection" in metrics:
+            endpoint_selection.append(
+                {
+                    "artifact": item.get("artifact") or item.get("source"),
+                    "stage": item["stage"],
+                    "source": item.get("source"),
+                    **{
+                        key: value
+                        for key, value in metrics["candidate_selection"].items()
+                        if key != "low_confidence_samples"
+                    },
+                }
+            )
         if item["stage"] in DATAFLOW_STAGES:
             dataflow[item["stage"]] = {
                 "status": item["status"],
@@ -92,6 +106,7 @@ def application_facts(app, signals):
         if body_selection
         else "This result has no explicit method-body selection metrics",
         "dataflow": dataflow,
+        "endpoint_selection": endpoint_selection or None,
         "review": {
             "required": bool(reasons),
             "reasons": reasons,
@@ -109,9 +124,13 @@ def report_facts(report, views, cancel=None, budget=None):
     artifacts = {}
     users = set()
     inventory = set()
+    endpoint_selections = {}
     for app, view in views:
         check_resources(cancel, budget)
         facts = view["facts"]
+        for selection in facts.get("endpoint_selection") or ():
+            key = (selection["artifact"], selection["stage"], selection["source"])
+            endpoint_selections[key] = selection
         applications["groups"] += 1
         applications["with_apk" if facts["has_artifacts"] else "without_apk"] += 1
         applications[
@@ -172,7 +191,38 @@ def report_facts(report, views, cancel=None, budget=None):
                 )
             ),
         },
-        "endpoints": {"scope": "app", "unit": "candidate_record", "records": endpoints},
+        "endpoints": {
+            "scope": "app",
+            "unit": "candidate_record",
+            "records": endpoints,
+            "selection": {
+                "scope": "artifact_stage",
+                "unit": "match_occurrence",
+                "policy_versions": sorted(
+                    {item["policy_version"] for item in endpoint_selections.values()}
+                ),
+                "observed_occurrences": dict(
+                    sum(
+                        (
+                            Counter(item["observed_occurrences"])
+                            for item in endpoint_selections.values()
+                        ),
+                        Counter(),
+                    )
+                ),
+                "low_confidence_sample_count": sum(
+                    item["low_confidence_sample_count"]
+                    for item in endpoint_selections.values()
+                ),
+                "low_confidence_samples_truncated": any(
+                    item["low_confidence_samples_truncated"]
+                    for item in endpoint_selections.values()
+                ),
+                "meaning": "Low-confidence tokens remain unknown; their removal from endpoint records does not establish reduced risk",
+            }
+            if endpoint_selections
+            else None,
+        },
         "sdks": {
             "scope": "app",
             "unit": "match_record",

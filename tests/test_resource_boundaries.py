@@ -216,7 +216,10 @@ class ResourceBoundaryTests(unittest.TestCase):
         self.assertEqual(reports.query(loaded, "endpoints")["total"], 8)
 
     def test_cli_memory_stop_after_parsing_preserves_reusable_checkpoints(self):
-        apk = make_apk(self.root / "input.apk")
+        apk = make_apk(
+            self.root / "input.apk",
+            entries={"assets/endpoints.txt": b"https://service.example/report"},
+        )
         program = """
 import contextlib
 import sys
@@ -649,7 +652,10 @@ raise SystemExit(analyze.scan(args))
                     )
 
     def test_cli_checks_cancellation_after_export_and_keeps_report_usable(self):
-        apk = make_apk(self.root / "input.apk")
+        apk = make_apk(
+            self.root / "input.apk",
+            entries={"assets/endpoints.txt": b"https://service.example/report"},
+        )
         program = """
 import contextlib
 import sys

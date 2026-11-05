@@ -17,6 +17,7 @@ from .common import (
 )
 from .endpoints import sanitized
 from .facts import application_facts, report_facts, system_classification
+from .metrics import phase
 from .storage import (
     COMPLETE_COVERAGE_STATUSES,
     EVIDENCE_SECTIONS,
@@ -583,13 +584,20 @@ def markdown(report, limit=100, cancel=None, budget=None, *, facts=None):
 
 
 def export_reports(
-    report, output, view_limit=100, write_analysis=True, cancel=None, budget=None
+    report,
+    output,
+    view_limit=100,
+    write_analysis=True,
+    cancel=None,
+    budget=None,
+    metrics=None,
 ):
     check_resources(cancel, budget)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if write_analysis:
-        atomic_json(output / "analysis.json", report, cancel, budget)
+        with phase(metrics, "analysis_json"):
+            atomic_json(output / "analysis.json", report, cancel, budget)
     overview = summary(report, cancel, budget)
     atomic_json(output / "summary.json", overview, cancel, budget)
     atomic_text(

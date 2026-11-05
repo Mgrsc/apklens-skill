@@ -79,7 +79,7 @@ Counts reflect the number of matched static locations (strings, method tables, b
 
 ## Endpoint and Domain Candidates
 
-`url` denotes candidates with explicit protocols, `scheme_relative` has unspecified protocol, `domain` denotes bare domain clues, and `unresolved_template` contains unresolved placeholders. Bare domains may originate from package names, documentation, tests, or samples, and should not be used directly as blocklists.
+`url` denotes explicit-protocol candidates, `scheme_relative` has unspecified protocol, `ip` is an IP literal, and `unresolved_template` contains unresolved placeholders. Under candidate policy 1, `domain` denotes a host with network context. Other dotted tokens remain unknown, with occurrence counts and bounded provenance samples in coverage `candidate_selection`; samples share the endpoint limit and can be truncated or displaced by higher-priority network locators. Inspect `facts.endpoints.selection`. A lower endpoint count does not establish lower risk. Older results without this policy can contain unqualified bare domains, including package names, documentation, tests or samples. Domain exports contain candidates and are not ready-to-use blocklists.
 
 Literal endpoint extraction and library dataflow models have separate protocol scopes. A `ws`, `wss` or `mqtt` string candidate alone does not imply a modeled sending path; a modeled destination also need not appear in the literal endpoint collection.
 
@@ -107,4 +107,4 @@ An exported component is not automatically a vulnerability; assess in combinatio
 
 {{limitations}}
 
-`domains.txt` contains all valid host and bare domain candidates; `telemetry-domains.txt` contains only candidates supported by telemetry paths or SDK rules. Neither proves actual network traffic; do not apply directly to firewalls or blocklists without review.
+Under candidate policy 1, `domains.txt` contains hosts from retained explicit URL/IP, scheme-relative, and network-context host candidates; bare dotted tokens remain unknown and are retained only as bounded coverage samples, not domain-export entries. Unsampled tokens cannot be reconstructed from saved results; reviewing them requires reparsing the retained APKs. Older results retain their original candidate policy. `telemetry-domains.txt` is the subset supported by telemetry paths or SDK rules. Neither proves actual network traffic; do not apply directly to firewalls or blocklists without review.

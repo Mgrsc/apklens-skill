@@ -32,11 +32,13 @@ User-facing assessments include practical, application-specific recommendations 
 
 ## URL Extraction
 
-Supports plaintext protocol URLs, scheme-relative addresses, bare domains, up to two layers of string escaping, HTML entities, bounded percent-encoding, and full Base64 literal decoding. Records transformation chains, artifact identities, entry paths, string indexes, byte offsets, or source line numbers.
+Supports plaintext protocol URLs, scheme-relative addresses, IP literals and hosts with explicit network-key/attribute context, plus up to two layers of string escaping, HTML entities, bounded percent-encoding, and full Base64 literal decoding. Records transformation chains, artifact identities, entry paths, string indexes, byte offsets, or source line numbers.
 
 Normalization handles host casing, IDNA, default ports, IPv6 formatting, and preserves path casing, query parameters, and parameter ordering. Does not connect to addresses, query DNS, or concatenate disparate strings. Unresolved placeholder patterns are preserved as unresolved templates.
 
-Arbitrary JavaScript expressions, complex runtime string builders, custom ciphers, dynamic configuration, and JNI constructions are not guaranteed to be fully resolved. Bare domains are conservative candidates and are not validated against public suffix lists or reputation services; package names, class names, documentation, and test fixtures may appear among candidates.
+IP syntax alone does not establish network intent: a token such as `1.2.3.4` may be a version string and is retained only as an IP-shaped candidate. Bare hardcoded hostnames without network context can be absent from domain exports. Once bounded unknown-token samples are truncated, the complete list cannot be reconstructed from saved results; reviewing it requires reparsing the retained APKs.
+
+Arbitrary JavaScript expressions, complex runtime string builders, custom ciphers, dynamic configuration, and JNI constructions are not guaranteed to be fully resolved. Bare dotted tokens without network context remain unknown and are summarized in `candidate_selection`, with source-class occurrence counts and at most 32 located samples sharing the endpoint limit. Samples can be displaced by explicit locators and can be truncated. Explicit URL/IP records outrank contextual hosts; same-priority admission keeps source order. This is not a public-suffix/reputation filter, a vendor allowlist or proof of network execution. App-scope endpoint counts and artifact-stage occurrence counts use separate units. Old results without candidate-policy metrics remain unknown; a lower endpoint count does not establish lower risk. Domain exports contain retained network candidates only.
 
 ## Permissions and Configuration
 

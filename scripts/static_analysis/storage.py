@@ -13,15 +13,18 @@ from .common import (
     MEMORY_BUDGET_MESSAGE,
     AnalysisError,
     Cancelled,
+    DiskBudgetExceeded,
     JsonRecords,
     MemoryBudgetExceeded,
     check_resources,
 )
 from .facts import application_facts, artifact_state
+from .metrics import phase
 
-STORE_VERSION = 3
+STORE_VERSION = 4
+SHARED_STORE_VERSION = 4
 INDEXED_STORE_VERSION = 2
-READABLE_STORE_VERSIONS = (1, 2, STORE_VERSION)
+READABLE_STORE_VERSIONS = (1, 2, 3, STORE_VERSION)
 SQLITE_PRIMARY_CODE_MASK = 0xFF
 SQLITE_READONLY_PRIMARY_CODE = 8
 STORE_CACHE_KIB = 8192
@@ -36,8 +39,15 @@ APP_SECTIONS = (
     "methods",
     "fields",
 )
+SECTION_CODES = {
+    name: index
+    for index, name in enumerate(dict.fromkeys((*ARTIFACT_SECTIONS, *APP_SECTIONS)), 1)
+}
 EVIDENCE_SECTIONS = ("endpoints", "sdks", "signals", "findings")
 EVIDENCE_INSERT_BATCH = 512
+RECORD_BATCH_ROWS = 512
+RECORD_BATCH_CHARACTERS = 1024 * 1024
+INSERT_STATEMENT_ROWS = 100
 COMPLETE_COVERAGE_STATUSES = {"COMPLETE", "NOT_APPLICABLE", "EXCLUDED"}
 
 
@@ -151,6 +161,14 @@ class Records(JsonRecords):
         return self.count_records()
 
     def count_records(self, identity=None):
+        if self.store.version >= SHARED_STORE_VERSION:
+            condition = " AND identity=?" if identity is not None else ""
+            return self.store.connection.execute(
+                "SELECT COUNT(*) FROM record_refs WHERE owner_id=(SELECT owner_id FROM owners WHERE scope=? AND identity=?) AND section_code=?"
+                + condition,
+                (self.scope, self.owner, SECTION_CODES.get(self.section))
+                + ((identity,) if identity is not None else ()),
+            ).fetchone()[0]
         condition = " AND identity=?" if identity is not None else ""
         return self.store.connection.execute(
             "SELECT COUNT(*) FROM records WHERE scope=? AND owner=? AND section=?"
@@ -289,13 +307,15 @@ class Apps(Sequence):
 
 
 class AnalysisStore:
-    def __init__(self, path, readonly=False, cancel=None, budget=None):
+    def __init__(self, path, readonly=False, cancel=None, budget=None, metrics=None):
         self.path = Path(path).resolve()
         self.readonly = readonly
         self.cancel = cancel
         self.budget = budget
+        self.metrics = metrics
         self.positions = {}
         self.version = STORE_VERSION
+        self.json_functions = None
         try:
             existing = self.path.is_file() and self.path.stat().st_size > 0
             if readonly:
@@ -313,6 +333,7 @@ class AnalysisStore:
                 if self.version not in READABLE_STORE_VERSIONS:
                     raise AnalysisError("Unsupported analysis database version")
             else:
+                self.connection.execute("PRAGMA foreign_keys=ON")
                 if existing and self.metadata("store_version") != STORE_VERSION:
                     raise AnalysisError(
                         "Existing database requires read-only access; resume into a new directory"
@@ -321,11 +342,22 @@ class AnalysisStore:
                     "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, payload TEXT NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS artifacts (identity TEXT PRIMARY KEY, status TEXT NOT NULL, payload TEXT NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS apps (identity TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, payload TEXT NOT NULL);"
-                    "CREATE TABLE IF NOT EXISTS records (scope TEXT NOT NULL, owner TEXT NOT NULL, section TEXT NOT NULL, ordinal INTEGER NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(scope,owner,section,identity));"
-                    "CREATE INDEX IF NOT EXISTS records_order ON records(scope,owner,section,ordinal);"
+                    "CREATE TABLE IF NOT EXISTS owners (owner_id INTEGER PRIMARY KEY, scope TEXT NOT NULL, identity TEXT NOT NULL, UNIQUE(scope,identity));"
+                    "CREATE TABLE IF NOT EXISTS sections (code INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);"
+                    "CREATE TABLE IF NOT EXISTS facts (fact_id INTEGER PRIMARY KEY, payload TEXT NOT NULL);"
+                    "CREATE TABLE IF NOT EXISTS record_refs (owner_id INTEGER NOT NULL REFERENCES owners(owner_id), section_code INTEGER NOT NULL REFERENCES sections(code), ordinal INTEGER NOT NULL, identity TEXT NOT NULL, fact_id INTEGER NOT NULL REFERENCES facts(fact_id), PRIMARY KEY(owner_id,section_code,ordinal), UNIQUE(owner_id,section_code,identity)) WITHOUT ROWID;"
+                    "CREATE INDEX IF NOT EXISTS record_refs_fact ON record_refs(fact_id);"
+                    "CREATE VIEW IF NOT EXISTS records AS SELECT o.scope AS scope,o.identity AS owner,s.name AS section,r.ordinal AS ordinal,r.identity AS identity,f.payload AS payload FROM record_refs r JOIN owners o ON o.owner_id=r.owner_id JOIN sections s ON s.code=r.section_code JOIN facts f ON f.fact_id=r.fact_id;"
                     "CREATE TABLE IF NOT EXISTS domains (host TEXT PRIMARY KEY, telemetry INTEGER NOT NULL);"
                     "CREATE TABLE IF NOT EXISTS evidence_refs (app_id TEXT NOT NULL, identity TEXT NOT NULL, ordinal INTEGER NOT NULL, section TEXT NOT NULL, parent TEXT NOT NULL, position INTEGER NOT NULL, PRIMARY KEY(app_id,identity)) WITHOUT ROWID;"
                     "CREATE INDEX IF NOT EXISTS evidence_order ON evidence_refs(app_id,ordinal);"
+                )
+                self.connection.executemany(
+                    "INSERT OR IGNORE INTO sections(code,name) VALUES (?,?)",
+                    ((code, name) for name, code in SECTION_CODES.items()),
+                )
+                self.connection.execute(
+                    "CREATE TEMP TABLE orphan_candidates (fact_id INTEGER PRIMARY KEY) WITHOUT ROWID"
                 )
                 self.set_metadata("store_version", STORE_VERSION)
                 self.connection.commit()
@@ -337,10 +369,19 @@ class AnalysisStore:
     def close(self):
         self.connection.close()
 
+    @contextmanager
+    def transaction(self):
+        try:
+            with self.connection:
+                yield
+        except BaseException:
+            self.positions.clear()
+            raise
+
     def check_cancel(self):
         try:
             check_resources(self.cancel, self.budget)
-        except (Cancelled, MemoryBudgetExceeded):
+        except (Cancelled, MemoryBudgetExceeded, DiskBudgetExceeded):
             if not self.readonly:
                 self.connection.rollback()
                 self.positions.clear()
@@ -361,6 +402,67 @@ class AnalysisStore:
     def records(self, scope, owner, section):
         return Records(self, scope, owner, section)
 
+    def _owner_id(self, scope, identity):
+        row = self.connection.execute(
+            "SELECT owner_id FROM owners WHERE scope=? AND identity=?",
+            (scope, identity),
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        return self.connection.execute(
+            "INSERT INTO owners(scope,identity) VALUES (?,?)", (scope, identity)
+        ).lastrowid
+
+    def _insert_payloads(self, key, rows):
+        if not rows:
+            return
+        if self.budget is not None:
+            self.budget.check_disk()
+        owner_id = self._owner_id(key[0], key[1])
+        code = SECTION_CODES[key[2]]
+        first = self.connection.execute(
+            "SELECT COALESCE(MAX(fact_id),0)+1 FROM facts"
+        ).fetchone()[0]
+        for offset in range(0, len(rows), INSERT_STATEMENT_ROWS):
+            batch = rows[offset : offset + INSERT_STATEMENT_ROWS]
+            self.connection.execute(
+                "INSERT INTO facts(fact_id,payload) VALUES "
+                + ",".join("(?,?)" for _ in batch),
+                [
+                    value
+                    for fact_id, row in enumerate(batch, first + offset)
+                    for value in (fact_id, row[2])
+                ],
+            )
+            self.connection.execute(
+                "INSERT INTO record_refs VALUES "
+                + ",".join("(?,?,?,?,?)" for _ in batch),
+                [
+                    value
+                    for fact_id, row in enumerate(batch, first + offset)
+                    for value in (owner_id, code, row[0], row[1], fact_id)
+                ],
+            )
+
+    def _delete_records(self, scope, identity):
+        row = self.connection.execute(
+            "SELECT owner_id FROM owners WHERE scope=? AND identity=?",
+            (scope, identity),
+        ).fetchone()
+        if row is None:
+            return
+        self.connection.execute(
+            "INSERT OR IGNORE INTO orphan_candidates SELECT fact_id FROM record_refs WHERE owner_id=?",
+            row,
+        )
+        self.connection.execute("DELETE FROM record_refs WHERE owner_id=?", row)
+
+    def _cleanup_facts(self):
+        self.connection.execute(
+            "DELETE FROM facts WHERE fact_id IN (SELECT fact_id FROM orphan_candidates) AND NOT EXISTS (SELECT 1 FROM record_refs WHERE record_refs.fact_id=facts.fact_id)"
+        )
+        self.connection.execute("DELETE FROM orphan_candidates")
+
     def append_records(self, scope, owner, section, values):
         key = (scope, owner, section)
         if key not in self.positions:
@@ -369,47 +471,85 @@ class AnalysisStore:
                 key,
             ).fetchone()[0]
 
-        def rows():
-            for value in values:
-                if scope == "app":
-                    self.check_cancel()
-                ordinal = self.positions[key]
-                payload = json.dumps(value, ensure_ascii=False, allow_nan=False)
-                self.positions[key] += 1
-                yield (
-                    *key,
+        rows = []
+        characters = 0
+        for value in values:
+            if scope == "app":
+                self.check_cancel()
+            ordinal = self.positions[key]
+            payload = json.dumps(value, ensure_ascii=False, allow_nan=False)
+            self.positions[key] += 1
+            rows.append(
+                (
                     ordinal,
                     value["id"]
                     if scope == "app" and section == "findings"
                     else str(ordinal),
                     payload,
                 )
-
-        self.connection.executemany("INSERT INTO records VALUES (?,?,?,?,?,?)", rows())
+            )
+            characters += len(payload)
+            if len(rows) >= RECORD_BATCH_ROWS or characters >= RECORD_BATCH_CHARACTERS:
+                self._insert_payloads(key, rows)
+                rows.clear()
+                characters = 0
+        self._insert_payloads(key, rows)
 
     def save_artifact(self, identity, result):
         value = {
             key: item for key, item in result.items() if key not in ARTIFACT_SECTIONS
         }
-        with self.connection:
-            self.connection.execute(
-                "DELETE FROM records WHERE scope='artifact' AND owner=?", (identity,)
-            )
+        with self.transaction():
+            self._delete_records("artifact", identity)
             for section in ARTIFACT_SECTIONS:
                 self.positions.pop(("artifact", identity, section), None)
                 self.append_records(
                     "artifact", identity, section, result.get(section, ())
                 )
-            self.connection.execute(
-                "INSERT OR REPLACE INTO artifacts VALUES (?,?,?)",
-                (
-                    identity,
-                    artifact_status(
-                        {"stages": self.records("artifact", identity, "stages")}
-                    ),
-                    json.dumps(value, ensure_ascii=False, allow_nan=False),
+            self._save_artifact_metadata(identity, value)
+            self._cleanup_facts()
+
+    def _save_artifact_metadata(self, identity, value):
+        self.connection.execute(
+            "INSERT OR REPLACE INTO artifacts VALUES (?,?,?)",
+            (
+                identity,
+                artifact_status(
+                    {"stages": self.records("artifact", identity, "stages")}
                 ),
-            )
+                json.dumps(value, ensure_ascii=False, allow_nan=False),
+            ),
+        )
+
+    def has_json_functions(self):
+        if self.json_functions is None:
+            try:
+                self.json_functions = self.connection.execute(
+                    "SELECT json_valid('{}'), json_extract('{\"id\":\"x\"}', '$.id')"
+                ).fetchone() == (1, "x")
+            except sqlite3.OperationalError:
+                self.json_functions = False
+        return self.json_functions
+
+    def raw_records(self, records, business_ids=False, check=None):
+        check = check or self.check_cancel
+        columns = "payload,json_valid(payload)"
+        if business_ids:
+            columns += ",json_extract(payload,'$.id'),json_type(payload,'$.id')"
+        cursor = records.store.connection.execute(
+            "SELECT "
+            + columns
+            + " FROM records WHERE scope=? AND owner=? AND section=? ORDER BY ordinal",
+            (records.scope, records.owner, records.section),
+        )
+        try:
+            for row in cursor:
+                check()
+                if row[1] != 1:
+                    raise AnalysisError("Checkpoint contains invalid JSON facts")
+                yield row
+        finally:
+            cursor.close()
 
     def artifact(self, identity):
         row = self.connection.execute(
@@ -454,18 +594,60 @@ class AnalysisStore:
             )
         )
 
-    def import_artifact(self, source, identity):
+    def import_artifact(self, source, identity, check=None):
+        check = check or self.check_cancel
+
         def records(values):
             for value in values:
-                self.check_cancel()
+                check()
                 yield value
 
-        self.check_cancel()
+        check()
         result = source.artifact(identity)
+        if source.has_json_functions() and all(
+            isinstance(result.get(section), Records) for section in ARTIFACT_SECTIONS
+        ):
+            try:
+                with self.transaction():
+                    self._delete_records("artifact", identity)
+                    for section in ARTIFACT_SECTIONS:
+                        key = ("artifact", identity, section)
+                        self.positions.pop(key, None)
+                        rows = []
+                        characters = 0
+                        ordinal = 0
+                        for row in self.raw_records(result[section], check=check):
+                            rows.append((ordinal, str(ordinal), row[0]))
+                            characters += len(row[0])
+                            ordinal += 1
+                            if (
+                                len(rows) >= RECORD_BATCH_ROWS
+                                or characters >= RECORD_BATCH_CHARACTERS
+                            ):
+                                self._insert_payloads(key, rows)
+                                rows.clear()
+                                characters = 0
+                        self._insert_payloads(key, rows)
+                        self.positions[key] = ordinal
+                    self._save_artifact_metadata(
+                        identity,
+                        {
+                            key: value
+                            for key, value in result.items()
+                            if key not in ARTIFACT_SECTIONS
+                        },
+                    )
+                    self._cleanup_facts()
+                    check()
+            except BaseException:
+                self.positions.clear()
+                raise
+            check()
+            return
         for section in ARTIFACT_SECTIONS:
             result[section] = records(result[section])
         self.save_artifact(identity, result)
-        self.check_cancel()
+        check()
 
     def update_artifact_metadata(self, identity, fields):
         result = self.artifact(identity)
@@ -484,9 +666,7 @@ class AnalysisStore:
 
     def begin_app(self, app):
         identity = app["id"]
-        self.connection.execute(
-            "DELETE FROM records WHERE scope='app' AND owner=?", (identity,)
-        )
+        self._delete_records("app", identity)
         self.connection.execute("DELETE FROM evidence_refs WHERE app_id=?", (identity,))
         self.connection.execute(
             "DELETE FROM metadata WHERE key=?", ("app_view:" + identity,)
@@ -496,28 +676,73 @@ class AnalysisStore:
             app[section] = self.records("app", identity, section)
 
     def merge(self, app_id, section, values, limits):
+        with phase(self.metrics, "app_merge"):
+            return self._merge(app_id, section, values, limits)
+
+    def _merge_inputs(self, values):
+        if isinstance(values, Records) and values.store is self:
+            cursor = self.connection.execute(
+                "SELECT f.payload,r.fact_id FROM record_refs r JOIN facts f ON f.fact_id=r.fact_id WHERE r.owner_id=? AND r.section_code=? ORDER BY r.ordinal",
+                (
+                    self._owner_id(values.scope, values.owner),
+                    SECTION_CODES[values.section],
+                ),
+            )
+            try:
+                for payload, fact_id in cursor:
+                    self.check_cancel()
+                    yield json.loads(payload), fact_id
+            finally:
+                cursor.close()
+        else:
+            for value in values:
+                yield value, None
+
+    def _merge(self, app_id, section, values, limits):
         truncated = False
         key = ("app", app_id, section)
+        owner_id = self._owner_id("app", app_id)
         ordinal = self.connection.execute(
             "SELECT COALESCE(MAX(ordinal),-1)+1 FROM records WHERE scope=? AND owner=? AND section=?",
             key,
         ).fetchone()[0]
-        for value in values:
+        if (
+            ordinal == 0
+            and isinstance(values, Records)
+            and values.store is self
+            and self.has_json_functions()
+            and self._seed_records(app_id, section, values)
+        ):
+            return False
+        for value, source_fact in self._merge_inputs(values):
             self.check_cancel()
             row = self.connection.execute(
                 "SELECT payload FROM records WHERE scope=? AND owner=? AND section=? AND identity=?",
                 (*key, value["id"]),
             ).fetchone()
             if row is None:
-                self.connection.execute(
-                    "INSERT INTO records VALUES (?,?,?,?,?,?)",
-                    (
-                        *key,
-                        ordinal,
-                        value["id"],
-                        json.dumps(value, ensure_ascii=False, allow_nan=False),
-                    ),
-                )
+                if source_fact is not None:
+                    self.connection.execute(
+                        "INSERT INTO record_refs VALUES (?,?,?,?,?)",
+                        (
+                            owner_id,
+                            SECTION_CODES[section],
+                            ordinal,
+                            value["id"],
+                            source_fact,
+                        ),
+                    )
+                else:
+                    self._insert_payloads(
+                        key,
+                        [
+                            (
+                                ordinal,
+                                value["id"],
+                                json.dumps(value, ensure_ascii=False, allow_nan=False),
+                            )
+                        ],
+                    )
                 ordinal += 1
                 continue
             target = json.loads(row[0])
@@ -536,20 +761,68 @@ class AnalysisStore:
             self.update_record(app_id, section, target)
         return truncated
 
+    def _seed_records(self, app_id, section, values):
+        if not self.connection.in_transaction:
+            self.connection.execute("BEGIN")
+        self.connection.execute("SAVEPOINT seed_records")
+        source_owner = self._owner_id(values.scope, values.owner)
+        target_owner = self._owner_id("app", app_id)
+        code = SECTION_CODES[section]
+        cursor = self.connection.execute(
+            "SELECT r.fact_id,json_extract(f.payload,'$.id'),json_type(f.payload,'$.id') FROM record_refs r JOIN facts f ON f.fact_id=r.fact_id WHERE r.owner_id=? AND r.section_code=? ORDER BY r.ordinal",
+            (source_owner, SECTION_CODES[values.section]),
+        )
+        rows = []
+        try:
+            for ordinal, row in enumerate(cursor):
+                self.check_cancel()
+                if row[2] != "text":
+                    raise ValueError("Fact business identity is not text")
+                rows.append((target_owner, code, ordinal, row[1], row[0]))
+                if len(rows) >= RECORD_BATCH_ROWS:
+                    self.connection.executemany(
+                        "INSERT INTO record_refs VALUES (?,?,?,?,?)", rows
+                    )
+                    rows.clear()
+            self.connection.executemany(
+                "INSERT INTO record_refs VALUES (?,?,?,?,?)", rows
+            )
+            self.connection.execute("RELEASE seed_records")
+            return True
+        except (sqlite3.IntegrityError, ValueError):
+            self.connection.execute("ROLLBACK TO seed_records")
+            self.connection.execute("RELEASE seed_records")
+            return False
+        finally:
+            cursor.close()
+
     def update_record(self, app_id, section, value):
+        owner_id = self._owner_id("app", app_id)
+        code = SECTION_CODES[section]
+        row = self.connection.execute(
+            "SELECT r.fact_id,f.payload FROM record_refs r JOIN facts f ON f.fact_id=r.fact_id WHERE r.owner_id=? AND r.section_code=? AND r.identity=?",
+            (owner_id, code, value["id"]),
+        ).fetchone()
+        if row is None:
+            return
+        payload = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        if payload == row[1]:
+            return
+        fact_id = self.connection.execute(
+            "INSERT INTO facts(payload) VALUES (?)", (payload,)
+        ).lastrowid
         self.connection.execute(
-            "UPDATE records SET payload=? WHERE scope='app' AND owner=? AND section=? AND identity=?",
-            (
-                json.dumps(value, ensure_ascii=False, allow_nan=False),
-                app_id,
-                section,
-                value["id"],
-            ),
+            "UPDATE record_refs SET fact_id=? WHERE owner_id=? AND section_code=? AND identity=?",
+            (fact_id, owner_id, code, value["id"]),
+        )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO orphan_candidates VALUES (?)", (row[0],)
         )
 
     def save_app(self, app):
-        with self.connection:
+        with phase(self.metrics, "projection"), self.transaction():
             self._save_app(app)
+            self._cleanup_facts()
 
     def _save_app(self, app):
         value = {key: item for key, item in app.items() if key not in APP_SECTIONS}
@@ -636,10 +909,16 @@ class AnalysisStore:
         return value
 
     def finding_ids(self, app_id):
-        cursor = self.connection.execute(
-            "SELECT identity FROM records WHERE scope='app' AND owner=? AND section='findings' ORDER BY ordinal",
-            (app_id,),
-        )
+        if self.version >= SHARED_STORE_VERSION:
+            cursor = self.connection.execute(
+                "SELECT identity FROM record_refs WHERE owner_id=(SELECT owner_id FROM owners WHERE scope='app' AND identity=?) AND section_code=? ORDER BY ordinal",
+                (app_id, SECTION_CODES["findings"]),
+            )
+        else:
+            cursor = self.connection.execute(
+                "SELECT identity FROM records WHERE scope='app' AND owner=? AND section='findings' ORDER BY ordinal",
+                (app_id,),
+            )
         try:
             for row in cursor:
                 self.check_cancel()

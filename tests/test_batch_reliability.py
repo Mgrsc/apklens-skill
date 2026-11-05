@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from support import make_apk, make_dex
+from support import legacy_store_layout, make_apk, make_dex
 
 from scripts.static_analysis.common import (
     AnalysisError,
@@ -302,7 +302,7 @@ class BatchReliabilityTests(unittest.TestCase):
                             identity, stages=iter(stages) if streamed else stages
                         ),
                     )
-            source.set_metadata("store_version", version)
+            legacy_store_layout(source.connection, version)
             source.connection.commit()
             before = source.path.read_bytes()
             previous = AnalysisStore(source.path, readonly=True)
@@ -392,7 +392,7 @@ class BatchReliabilityTests(unittest.TestCase):
                 artifact["sha256"], self.result(artifact["sha256"], "PARTIAL")
             )
             source.connection.execute("UPDATE artifacts SET status='COMPLETE'")
-            source.set_metadata("store_version", version)
+            legacy_store_layout(source.connection, version)
             source.connection.commit()
             previous = AnalysisStore(source.path, readonly=True)
             self.addCleanup(previous.close)

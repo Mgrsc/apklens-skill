@@ -142,16 +142,17 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(endpoint["tags"], ["telemetry_path_candidate"])
         self.assertNotIn("dataflow", endpoint)
 
-    def test_template_and_bare_domains_are_distinct(self):
+    def test_template_contextual_hosts_and_unknown_tokens_are_distinct(self):
         collector = EndpointCollector(Limits())
         collector.add_text(
-            "https://${host}/events sample.example.org com.example.App",
+            "https://${host}/events host=sample.example.org com.example.App",
             {"entry": "assets/config", "kind": "asset_strings"},
         )
         self.assertTrue(
             any(item["kind"] == "unresolved_template" for item in collector.results())
         )
         self.assertTrue(any(item["kind"] == "domain" for item in collector.results()))
+        self.assertEqual(collector.samples[0]["value"], "com.example.App")
 
     def test_redaction_and_budget_are_explicit(self):
         value = sanitized(

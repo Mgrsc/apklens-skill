@@ -1,7 +1,39 @@
 import hashlib
+import json
 import struct
 import zipfile
 import zlib
+
+
+def legacy_store_layout(connection, version):
+    connection.commit()
+    connection.execute("PRAGMA foreign_keys=OFF")
+    row = connection.execute(
+        "SELECT type FROM sqlite_master WHERE name='records'"
+    ).fetchone()
+    if row == ("view",):
+        connection.executescript(
+            "CREATE TABLE legacy_records (scope TEXT NOT NULL, owner TEXT NOT NULL, section TEXT NOT NULL, ordinal INTEGER NOT NULL, identity TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(scope,owner,section,identity));"
+            "INSERT INTO legacy_records SELECT * FROM records;"
+            "DROP VIEW records;"
+            "ALTER TABLE legacy_records RENAME TO records;"
+            "CREATE INDEX records_order ON records(scope,owner,section,ordinal);"
+            "DROP TABLE record_refs;"
+            "DROP TABLE facts;"
+            "DROP TABLE sections;"
+            "DROP TABLE owners;"
+        )
+    if version == 1:
+        connection.execute("DROP TABLE IF EXISTS evidence_refs")
+        connection.execute("DELETE FROM metadata WHERE key LIKE 'app_view:%'")
+        connection.execute(
+            "UPDATE records SET identity=CAST(ordinal AS TEXT) WHERE scope='app' AND section='findings'"
+        )
+    connection.execute(
+        "INSERT OR REPLACE INTO metadata VALUES ('store_version',?)",
+        (json.dumps(version),),
+    )
+    connection.commit()
 
 
 def uleb(value):

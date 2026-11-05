@@ -1,4 +1,5 @@
 import re
+from functools import lru_cache
 
 from .common import stable_id
 from .endpoints import host_matches
@@ -107,25 +108,41 @@ SIGNAL_PATTERNS = {
     "diagnostic_field": r"(?i)(?:^|[^a-z0-9])(crash|stacktrace|stack_trace|session_id|device_id|advertising_id|event_name|screen_name|trace_id|oaid)(?:$|[^a-z0-9])",
 }
 SIGNALS = {name: re.compile(pattern) for name, pattern in SIGNAL_PATTERNS.items()}
+SIGNAL_CACHE_ENTRIES = 8192
+SIGNAL_CACHE_TEXT_LENGTH = 1024
+
+
+def signal_decisions(value, level):
+    precise = call_signal(value) if level == "E2" else None
+    return tuple(
+        name
+        for name, pattern in SIGNALS.items()
+        if (pattern.search(value) or name == precise)
+        and not (level == "E2" and name in PRECISE_CALL_SIGNALS and name != precise)
+    )
+
+
+cached_signal_decisions = lru_cache(maxsize=SIGNAL_CACHE_ENTRIES)(signal_decisions)
 
 
 def signal_matches(value, source, level="E1"):
     findings = []
-    precise = call_signal(value) if level == "E2" else None
-    for name, pattern in SIGNALS.items():
-        if pattern.search(value) or name == precise:
-            if level == "E2" and name in PRECISE_CALL_SIGNALS and name != precise:
-                continue
-            evidence = {**source, "excerpt": value[:2048]}
-            evidence["id"] = stable_id("signal_evidence", name, source, value)
-            findings.append(
-                {
-                    "id": stable_id("signal", name, evidence["id"]),
-                    "type": name,
-                    "evidence_level": level,
-                    "evidence": [evidence],
-                }
-            )
+    decisions = (
+        cached_signal_decisions
+        if len(value) <= SIGNAL_CACHE_TEXT_LENGTH
+        else signal_decisions
+    )
+    for name in decisions(value, level):
+        evidence = {**source, "excerpt": value[:2048]}
+        evidence["id"] = stable_id("signal_evidence", name, source, value)
+        findings.append(
+            {
+                "id": stable_id("signal", name, evidence["id"]),
+                "type": name,
+                "evidence_level": level,
+                "evidence": [evidence],
+            }
+        )
     return findings
 
 

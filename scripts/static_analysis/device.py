@@ -4,12 +4,14 @@ from pathlib import Path
 
 from .common import (
     AnalysisError,
+    Cancelled,
     atomic_json,
+    publish_collected_file,
     run_command,
-    snapshot_file,
     stable_id,
     stage,
 )
+from .metrics import phase
 
 PACKAGE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
 PACKAGE_BLOCK = re.compile(r"^\s{2}Package \[([^\]]+)\]")
@@ -169,6 +171,7 @@ class DeviceCollector:
         cancel,
         timeout=60,
         checkpoint=None,
+        metrics=None,
     ):
         if (
             not serial
@@ -193,6 +196,7 @@ class DeviceCollector:
         self.installed_count = 0
         self.targets = []
         self.excluded_packages = []
+        self.metrics = metrics
 
     def snapshot(self):
         return {
@@ -212,11 +216,23 @@ class DeviceCollector:
             self.checkpoint(self.snapshot(), complete)
 
     def shell(self, arguments):
-        result = run_command(
-            [self.executable, "-s", self.serial, "shell", shlex.join(arguments)],
-            timeout=self.timeout,
-            cancel=self.cancel,
+        category = (
+            "inventory"
+            if arguments[:3] == ["pm", "list", "packages"]
+            else "package_paths"
+            if arguments[:2] == ["pm", "path"]
+            else "permissions"
+            if arguments[:2] == ["dumpsys", "package"]
+            else "appops"
+            if arguments[:2] == ["cmd", "appops"]
+            else "settings"
         )
+        with phase(self.metrics, "collection_command_" + category):
+            result = run_command(
+                [self.executable, "-s", self.serial, "shell", shlex.join(arguments)],
+                timeout=self.timeout,
+                cancel=self.cancel,
+            )
         if result["status"] == "COMPLETE" and re.search(
             r"(?im)^(?:error:|exception occurred|java\.lang\.SecurityException|permission denial:)",
             result["stdout"],
@@ -224,6 +240,10 @@ class DeviceCollector:
             result["status"], result["reason"] = (
                 "FAILED",
                 "Device denied or rejected the command",
+            )
+        if self.metrics:
+            self.metrics.increment(
+                **{"collection_command_" + category + "_" + result["status"].lower(): 1}
             )
         return result
 
@@ -397,20 +417,33 @@ class DeviceCollector:
             )
             for remote in valid_paths:
                 target = self.output / (stable_id(package, remote) + ".apk")
-                result = run_command(
-                    [self.executable, "-s", self.serial, "pull", remote, str(target)],
-                    timeout=self.timeout,
-                    cancel=self.cancel,
-                    watched_file=target,
-                    max_file_bytes=self.limits.max_apk_bytes,
-                )
+                with phase(self.metrics, "collection_pull"):
+                    result = run_command(
+                        [
+                            self.executable,
+                            "-s",
+                            self.serial,
+                            "pull",
+                            remote,
+                            str(target),
+                        ],
+                        timeout=self.timeout,
+                        cancel=self.cancel,
+                        watched_file=target,
+                        max_file_bytes=self.limits.max_apk_bytes,
+                    )
+                if self.metrics:
+                    self.metrics.increment(
+                        **{"collection_pull_" + result["status"].lower(): 1}
+                    )
                 if result["status"] == "COMPLETE" and target.is_file():
                     try:
-                        artifact = snapshot_file(
+                        artifact = publish_collected_file(
                             target,
                             self.output.parent / "artifacts",
                             self.limits,
                             self.cancel,
+                            self.metrics,
                         )
                         artifact.update(
                             {
@@ -429,7 +462,14 @@ class DeviceCollector:
                         )
                     except (AnalysisError, OSError) as error:
                         item["stages"].append(
-                            stage("artifact_collection", "FAILED", remote, str(error))
+                            stage(
+                                "artifact_collection",
+                                "CANCELLED"
+                                if isinstance(error, Cancelled)
+                                else "FAILED",
+                                remote,
+                                str(error),
+                            )
                         )
                 else:
                     item["stages"].append(

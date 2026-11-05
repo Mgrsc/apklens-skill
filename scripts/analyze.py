@@ -17,6 +17,7 @@ from static_analysis import ENGINE_VERSION, SCHEMA_VERSION
 from static_analysis.common import (
     AnalysisError,
     Cancelled,
+    DiskBudgetExceeded,
     Limits,
     MemoryBudgetExceeded,
     TaskBudget,
@@ -24,12 +25,14 @@ from static_analysis.common import (
     atomic_json,
     check_resources,
     diagnostic,
+    process_tree_rss,
     run_command,
     snapshot_file,
     stage,
 )
 from static_analysis.device import PACKAGE_PATTERN, DeviceCollector, parse_devices
 from static_analysis.engine import analyze_many, build_apps, source_view
+from static_analysis.metrics import PerformanceMetrics
 from static_analysis.privacy_models import MODEL_VERSION
 from static_analysis.reports import export_reports
 from static_analysis.rules import RULE_VERSION
@@ -50,7 +53,7 @@ LIMITATIONS = [
     "Entry reachability, default settings, cloud controls, authorization, actual uploads, capture duration, file retention and automatic reinstallation require separately authorized runtime evidence; this scan does not collect it.",
     "Resource string pools are inspected, but resource references, configuration qualifiers and effective network-security or backup policies are not resolved.",
     "Native analysis is limited to printable strings. Complex reflection, encrypted strings, arbitrary runtime construction and nested compressed assets are not fully resolved.",
-    "Bare domains may be package names, documentation or examples. SDK and telemetry classifications are versioned heuristics, not observed network behavior.",
+    "Endpoints include explicit network locators and contextual hosts. Bare dotted tokens remain unknown and are summarized with bounded provenance samples and counts; fewer endpoint records do not establish lower risk. SDK and telemetry classifications are versioned heuristics, not observed network behavior.",
     "Device metadata is a non-atomic, user-scoped snapshot. Missing permission or AppOps entries are unknown, not denied or granted.",
     "Results and caches remain local, but sending evidence to a remote model is a separate disclosure. URL redaction is limited and does not remove every possible secret.",
 ]
@@ -106,8 +109,18 @@ def build_parser():
     )
     scan.add_argument("--mode", choices=("quick", "standard", "decompile"))
     scan.add_argument("--jobs", type=positive_int)
+    scan.add_argument(
+        "--executor",
+        choices=("thread", "process"),
+        help="Artifact executor; process mode is supported on Linux and budgets total task-tree RSS",
+    )
     scan.add_argument("--cache-dir", type=Path)
     scan.add_argument("--no-cache", action="store_true")
+    scan.add_argument(
+        "--skip-analysis-json",
+        action="store_true",
+        help="Keep SQLite and lightweight exports without writing the full analysis JSON",
+    )
     scan.add_argument("--max-entry-mib", type=positive_int)
     scan.add_argument("--max-total-mib", type=positive_int)
     scan.add_argument("--max-results", type=positive_int)
@@ -115,7 +128,7 @@ def build_parser():
     scan.add_argument(
         "--memory-mib",
         type=positive_int,
-        help="Cooperative process RSS budget; default adapts to available host/cgroup memory",
+        help="Cooperative RSS budget: current process for thread, total task tree for process; default adapts to available host/cgroup memory",
     )
     scan.add_argument(
         "--collect-only",
@@ -144,10 +157,18 @@ def validate_scan(args):
         raise AnalysisError("User must be nonnegative and jobs must be between 1 and 8")
     if args.mode not in {"quick", "standard", "decompile"}:
         raise AnalysisError("Invalid analysis mode in saved configuration")
+    if args.executor not in {"thread", "process"}:
+        raise AnalysisError("Invalid executor in saved configuration")
+    if args.executor == "process" and (
+        sys.platform != "linux" or process_tree_rss() is None
+    ):
+        raise AnalysisError(
+            "Process executor requires Linux process tree accounting; use --executor thread"
+        )
     for key in DEFAULT_CONFIGURATION:
         value = getattr(args, key)
         if (
-            key != "mode"
+            key not in {"mode", "executor"}
             and not (key == "memory_mib" and value is None)
             and (type(value) is not int or value < 1)
         ):
@@ -220,8 +241,12 @@ def scan(args):
     results = None
     task_budget = None
     resources = ExitStack()
+    status = "FAILED"
+    metrics = PerformanceMetrics(args.output, run_id, configuration)
 
     def stop_reason():
+        if task_budget is not None and task_budget.disk_exceeded:
+            return "disk_budget"
         if (task_budget is not None and task_budget.memory_exceeded) or (
             results is not None
             and any(result.get("resource_limited") for result in results.values())
@@ -243,26 +268,28 @@ def scan(args):
             diagnostic(event_name, correlation_id=run_id, **fields)
 
     def persist(complete=False):
-        save_snapshot(
-            args.output / "snapshot.json",
-            configuration,
-            artifacts,
-            snapshot,
-            stages,
-            complete,
-            input_kind,
-        )
+        with metrics.measure("snapshot"):
+            save_snapshot(
+                args.output / "snapshot.json",
+                configuration,
+                artifacts,
+                snapshot,
+                stages,
+                complete,
+                input_kind,
+            )
 
     def device_checkpoint(device, complete):
-        save_snapshot(
-            args.output / "snapshot.json",
-            configuration,
-            device["artifacts"],
-            device,
-            device["stages"],
-            complete,
-            "device",
-        )
+        with metrics.measure("snapshot"):
+            save_snapshot(
+                args.output / "snapshot.json",
+                configuration,
+                device["artifacts"],
+                device,
+                device["stages"],
+                complete,
+                "device",
+            )
 
     try:
         if saved:
@@ -273,7 +300,8 @@ def scan(args):
             collection_complete = saved["collection_complete"]
             persist(collection_complete)
             progress({"event": "verification_started", "total": len(artifacts)})
-            verify_artifacts(artifacts, cancel)
+            with metrics.measure("verify"):
+                verify_artifacts(artifacts, cancel)
             if not collection_complete:
                 stages.append(
                     stage(
@@ -293,9 +321,11 @@ def scan(args):
                 cancel,
                 args.adb_timeout,
                 checkpoint=device_checkpoint,
+                metrics=metrics,
             )
             try:
-                snapshot = collector.collect(args.package)
+                with metrics.measure("collection"):
+                    snapshot = collector.collect(args.package)
                 collection_complete = not cancel.is_set()
             except (AnalysisError, OSError) as error:
                 snapshot = collector.snapshot()
@@ -381,12 +411,36 @@ def scan(args):
                 )
             )
             return 130 if status == "CANCELLED" else 1 if status == "FAILED" else 0
-        plan = resource_plan(artifacts, args.output, limits, args.jobs, args.memory_mib)
+        plan = resource_plan(
+            artifacts,
+            args.output,
+            limits,
+            args.jobs,
+            args.memory_mib,
+            write_analysis=not args.skip_analysis_json,
+            resume_path=args.resume,
+            executor=args.executor,
+        )
         limits = replace(limits, memory_bytes=plan["memory_budget_bytes"])
-        task_budget = TaskBudget(limits, cancel)
+        metrics.runtime.update(
+            executor=args.executor,
+            effective_jobs=plan["jobs"],
+            memory_budget_bytes=plan["memory_budget_bytes"],
+            disk_reserve_bytes=plan["disk_reserve_bytes"],
+        )
+        task_budget = TaskBudget(
+            limits,
+            cancel,
+            disk_path=args.output,
+            min_free_bytes=plan["disk_reserve_bytes"],
+            process_tree=args.executor == "process",
+        )
         progress({"event": "preflight", **plan})
         store = AnalysisStore(
-            args.output / "analysis.sqlite3", cancel=cancel, budget=task_budget
+            args.output / "analysis.sqlite3",
+            cancel=cancel,
+            budget=task_budget,
+            metrics=metrics,
         )
         resources.callback(store.close)
         store.set_metadata("configuration", configuration)
@@ -398,19 +452,22 @@ def scan(args):
         cache_directory = (
             None if args.no_cache else (args.cache_dir or args.output.parent / "cache")
         )
-        results = analyze_many(
-            artifacts,
-            limits,
-            args.mode,
-            cancel,
-            plan["jobs"],
-            cache_directory,
-            progress,
-            store=store,
-            resume_store=resume_store,
-            retry_incomplete=args.retry_incomplete,
-            source_tool=args.jadx,
-        )
+        with metrics.measure("artifact_analysis"):
+            results = analyze_many(
+                artifacts,
+                limits,
+                args.mode,
+                cancel,
+                plan["jobs"],
+                cache_directory,
+                progress,
+                store=store,
+                resume_store=resume_store,
+                retry_incomplete=args.retry_incomplete,
+                source_tool=args.jadx,
+                metrics=metrics,
+                executor_kind=args.executor,
+            )
         if cancel.is_set():
             raise Cancelled("Artifact analysis interrupted; checkpoints preserved")
         task_budget.check()
@@ -472,15 +529,16 @@ def scan(args):
         if cancel.is_set():
             raise Cancelled("Supplemental analysis interrupted; checkpoints preserved")
         progress({"event": "aggregation_started"})
-        apps = build_apps(
-            artifacts,
-            results,
-            snapshot,
-            limits,
-            args.mode,
-            store=store,
-            progress=progress,
-        )
+        with metrics.measure("application_analysis"):
+            apps = build_apps(
+                artifacts,
+                results,
+                snapshot,
+                limits,
+                args.mode,
+                store=store,
+                progress=progress,
+            )
         all_stages = chain(stages, (item for app in apps for item in app["coverage"]))
         if cancel.is_set():
             status = "CANCELLED"
@@ -540,8 +598,18 @@ def scan(args):
             "limitations": LIMITATIONS,
         }
         store.save_report(report)
+        metrics.milestone("analysis_finished_at")
         progress({"event": "export_started", "status": status, **report["totals"]})
-        files = export_reports(report, args.output, cancel=cancel, budget=task_budget)
+        with metrics.measure("export"):
+            files = export_reports(
+                report,
+                args.output,
+                write_analysis=not args.skip_analysis_json,
+                cancel=cancel,
+                budget=task_budget,
+                metrics=metrics,
+            )
+        metrics.milestone("export_finished_at")
         check_resources(cancel, task_budget)
         files["analysis.sqlite3"] = str(store.path)
         files["snapshot.json"] = str(args.output / "snapshot.json")
@@ -565,9 +633,12 @@ def scan(args):
             )
         )
         return 130 if status == "CANCELLED" else 1 if status == "FAILED" else 0
-    except (Cancelled, MemoryBudgetExceeded) as error:
+    except (Cancelled, MemoryBudgetExceeded, DiskBudgetExceeded) as error:
+        status = "CANCELLED"
         reason = (
-            "memory_budget"
+            "disk_budget"
+            if isinstance(error, DiskBudgetExceeded)
+            else "memory_budget"
             if isinstance(error, MemoryBudgetExceeded)
             else stop_reason() or "cancelled"
         )
@@ -588,9 +659,20 @@ def scan(args):
         )
         return 130
     finally:
-        resources.close()
-        for signum, handler in handlers.items():
-            signal.signal(signum, handler)
+        try:
+            resources.close()
+        finally:
+            metrics.close(
+                "FAILED"
+                if sys.exc_info()[0] is not None
+                and not isinstance(
+                    sys.exc_info()[1],
+                    (Cancelled, MemoryBudgetExceeded, DiskBudgetExceeded),
+                )
+                else status
+            )
+            for signum, handler in handlers.items():
+                signal.signal(signum, handler)
 
 
 def main():

@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from support import make_apk, make_dex
+from support import legacy_store_layout, make_apk, make_dex
 
 from scripts.static_analysis import storage
 from scripts.static_analysis.common import (
@@ -285,12 +285,7 @@ class PerformanceTests(unittest.TestCase):
         path = self.root / "legacy.sqlite3"
         connection = sqlite3.connect(path)
         store.connection.backup(connection)
-        connection.execute("DROP TABLE evidence_refs")
-        connection.execute("DELETE FROM metadata WHERE key LIKE 'app_view:%'")
-        connection.execute("UPDATE metadata SET payload='1' WHERE key='store_version'")
-        connection.execute(
-            "UPDATE records SET identity=CAST(ordinal AS TEXT) WHERE scope='app' AND section='findings'"
-        )
+        legacy_store_layout(connection, 1)
         connection.commit()
         connection.close()
         return path
@@ -544,7 +539,7 @@ class PerformanceTests(unittest.TestCase):
             )
         )
 
-    def test_endpoint_optimization_matches_original_evidence_and_truncation(self):
+    def test_endpoint_selection_preserves_versioned_evidence_and_truncation(self):
         cases = (
             "alpha.example.org https://one.example.org/path //two.example.org/a",
             "https://one.example.org/path/inside.example.org?next=other.example.org",
@@ -582,8 +577,16 @@ class PerformanceTests(unittest.TestCase):
         digest = hashlib.sha256(
             json.dumps(outputs, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+        self.assertEqual(len(outputs[0]["records"]), 11)
+        self.assertTrue(
+            all(
+                item["candidate_class"] == "explicit_url"
+                for item in outputs[0]["records"]
+            )
+        )
+        self.assertEqual(len(outputs[1]["records"]), 2)
         self.assertEqual(
-            digest, "1b01208ce40689f9ffd492a71d743e7f0c02a57a8a8981cb088ef2463f53dc34"
+            digest, "fe7f46426d067d475139efac1c87399f03834a78c876171648d0d3cb76166913"
         )
 
     def test_sdk_optimization_matches_original_rule_evidence(self):

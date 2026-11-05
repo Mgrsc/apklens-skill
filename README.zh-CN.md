@@ -48,13 +48,18 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 - `analysis.json`：包含 E0–E4 发现项和有界方法/字段结构的机器可读证据导出。
 - `analysis.sqlite3`：持久检查点与最终事实，大任务查询和重新导出的首选输入。
 - `snapshot.json` / `progress.json`：可复用的采集状态与最新执行阶段。
+- `performance.json`：本地阶段耗时、资源峰值、有效配置与代码身份。
 - `domains.txt` / `telemetry-domains.txt`：归一化的网络端点与第三方遥测域名候选。
 
 通过 Skill 执行分析时，AI 先准备覆盖全部应用组的 `assessment.json`，核查证据并记录逐应用决策，再校验并生成独立的 `user-advice.md`。[评估契约](references/assessment.md) 定义命令与评估状态。校验 PASS 不等于每个应用都已审查，待核查、延期和只有元数据的目标始终明确展示。脚本生成的 `report.md` 包含事实和核查提示。使用 `--section apps --package PACKAGE` 可查询已有安装上下文和有界建议证据样本。建议不代表已授权修改设备，审查分数高也不表示应用可以安全停用。
 
 使用 `summary.facts` 读取应用层端点候选、SDK 匹配记录／名称／涉及应用数、权限来源及各自的输入与解析分母，不要叠加制品层和应用层统计。摘要与 Markdown 上限仅限制展示，使用 `has_more`／`next_offset` 分页检查全部目标。系统标记不能证明出厂预装或用户主动安装。两阶段方法保留与根级额度让晚位敏感区域获得分析机会，同时披露未保留方法体、未启动根和模型缺口。
 
-大任务优先查询 `analysis.sqlite3`，避免整体读取 JSON 导出。数据库为 ID、分页和证据引用建立索引，轻量视图避免摘要全量扫描。新任务写入数据库版本 3，JSON 继续保持 schema 1；沿用版本 1/2 的读取路径。可用 `python3 scripts/analyze.py scan --resume previous_task_dir --output new_task_dir` 恢复任务；请保留原任务目录及其引用的 APK。恢复时在新目录重建应用分析与索引。仅采集、离线快照及内存预算详见使用参考。
+大任务优先查询 `analysis.sqlite3`，避免整体读取 JSON 导出。数据库为 ID、分页和证据引用建立索引，轻量视图避免摘要全量扫描。新任务写入数据库版本 4，通过不可变事实正文共享和应用更新时复制减少重复；JSON 继续保持 schema 1，版本 1/2/3 数据库仍可只读查询，无需迁移。可用 `python3 scripts/analyze.py scan --resume previous_task_dir --output new_task_dir` 恢复任务；请保留原任务目录及其引用的 APK。恢复时在新目录重建应用分析与索引。仅采集、离线快照及内存预算详见使用参考。
+
+Linux 上的 CPU 密集批量任务可显式使用 `--executor process --jobs 2`，默认仍为 `thread`。进程 worker 使用私有结果库、最终库单写者、任务进程树 RSS 检查和有界退出。进程需要更多内存和临时 I/O，请按实际任务比较本地测量结果。`--skip-analysis-json` 可明确省略完整 JSON，同时保留 SQLite 和轻量报告。预检估算新增磁盘占用并保留安全余量；估算与 RSS 保护均为协作式软限制。预检是分析启动前的硬门槛：可用空间不足“预计新增峰值 + max(4 GiB, 预计新增峰值的 20%)”时拒绝启动分析；小任务和仅元数据任务同样适用，且没有覆盖开关。
+
+端点记录现仅包含显式 URL/IP 和带网络上下文的主机名。其他裸点分文本保持未知，其计数与有界溯源样本见覆盖及 `summary.facts.endpoints.selection`；端点变少不代表风险降低。域名导出仅包含保留的网络候选。
 
 摘要中的 `review_required_total` 统计具有声明能力或敏感线索、需要审查的应用，不是已证实的隐私问题或传输路径数。审查排序按独立证据路径和地址分组计数，条件变体不重复加分；发现项计数仍表示实际保留记录数。每组最多保留 4 个条件变体，截断会标为 PARTIAL。方法/字段事实保留量与解释范围上限分别计算，具体预算及 E3/E4 共享覆盖指标见[隐私模型与限制](references/privacy-analysis.md)。
 

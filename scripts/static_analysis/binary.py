@@ -92,11 +92,12 @@ def string_pool(reader, offset, limits, budget):
     for index in checked_range(count, budget):
         position = offset + strings_start + reader.u32(offset + header_size + index * 4)
         if flags & 0x100:
-            _, position = length_at(position, False)
+            utf16_length, position = length_at(position, False)
             length, position = length_at(position, False)
             width, encoding = 1, "utf-8"
         else:
             length, position = length_at(position, True)
+            utf16_length = length
             width, encoding = 2, "utf-16-le"
         byte_length = length * width
         if byte_length > limits.max_string_bytes:
@@ -104,11 +105,17 @@ def string_pool(reader, offset, limits, budget):
         reader.require(position, byte_length + width, end)
         if any(reader.data[position + byte_length : position + byte_length + width]):
             raise AnalysisError("Resource string has no terminator")
+        value = reader.data[position : position + byte_length].decode(
+            encoding, "surrogatepass" if width == 1 else "strict"
+        )
+        utf16 = value.encode("utf-16-le", "surrogatepass")
+        if len(utf16) // 2 != utf16_length:
+            raise AnalysisError("Resource string UTF-16 length does not match its data")
+        if width == 1:
+            value = utf16.decode("utf-16-le", "strict")
         output.append(
             {
-                "value": reader.data[position : position + byte_length].decode(
-                    encoding, "strict"
-                ),
+                "value": value,
                 "offset": position,
                 "string_index": index,
             }

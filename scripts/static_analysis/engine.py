@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -903,6 +904,7 @@ def analyze_many(
     source_tool=None,
     metrics=None,
     executor_kind="thread",
+    deadline=None,
 ):
     unique = {artifact["sha256"]: artifact for artifact in artifacts}
     pending = iter(sorted(unique.values(), key=lambda artifact: artifact["sha256"]))
@@ -953,7 +955,7 @@ def analyze_many(
 
         def unparsed():
             for artifact in pending:
-                if cancel.is_set():
+                if cancel.is_set() or deadline is not None and deadline.expired():
                     break
                 if resume_store and resume_store.reusable(
                     artifact["sha256"],
@@ -984,7 +986,11 @@ def analyze_many(
         with ThreadPoolExecutor(max_workers=jobs) as executor:
             try:
                 while True:
-                    while not cancel.is_set() and len(active) < jobs:
+                    while (
+                        not cancel.is_set()
+                        and len(active) < jobs
+                        and not (deadline is not None and deadline.expired())
+                    ):
                         artifact = next(pending, None)
                         if artifact is None:
                             break
@@ -1035,6 +1041,7 @@ def analyze_many(
                     future.cancel()
                 raise
     for identity in unique.keys() - results.keys():
+        timed_out = deadline is not None and deadline.exhausted and not cancel.is_set()
         results[identity] = {
             "sha256": identity,
             "manifest": None,
@@ -1046,9 +1053,11 @@ def analyze_many(
             "stages": [
                 stage(
                     "artifact_analysis",
-                    "CANCELLED",
+                    "DEFERRED" if timed_out else "CANCELLED",
                     identity,
-                    "Artifact was not started",
+                    "Offline analysis time budget exhausted; artifact was not started"
+                    if timed_out
+                    else "Artifact was not started",
                 )
             ],
             "cache": {"hit": False},
@@ -1059,13 +1068,13 @@ def analyze_many(
 
 def source_view(artifact, output, executable, limits, cancel):
     started = time.monotonic()
+    budget = Budget(limits, cancel)
     resource_limited = False
     result = run_command(
         [executable, "--no-res", "-d", str(output), artifact["path"]],
         timeout=limits.timeout,
         cancel=cancel,
     )
-    budget = Budget(limits, cancel)
     collector = EndpointCollector(limits, budget)
     signals = []
     total_bytes = 0
@@ -1177,13 +1186,17 @@ def merge_records(records, limits):
     return list(merged.values()), truncated
 
 
-def build_apps(artifacts, results, snapshot, limits, mode, store=None, progress=None):
+def build_apps(
+    artifacts, results, snapshot, limits, mode, store=None, progress=None, deadline=None
+):
     transaction = store.transaction() if store else nullcontext()
     with transaction:
-        return _build_apps(artifacts, results, snapshot, limits, mode, store, progress)
+        return _build_apps(
+            artifacts, results, snapshot, limits, mode, store, progress, deadline
+        )
 
 
-def _build_apps(artifacts, results, snapshot, limits, mode, store, progress):
+def _build_apps(artifacts, results, snapshot, limits, mode, store, progress, deadline):
     groups = {}
     for artifact in artifacts:
         if store:
@@ -1396,11 +1409,26 @@ def _build_apps(artifacts, results, snapshot, limits, mode, store, progress):
                 stage(name, "DEFERRED", package, "Quick mode excludes dataflow")
                 for name in ("method_dataflow_E3", "interprocedural_dataflow_E4")
             )
+        elif deadline is not None and deadline.expired():
+            app["coverage"].extend(
+                stage(
+                    name,
+                    "DEFERRED",
+                    package,
+                    "Offline analysis time budget exhausted; dataflow was not started",
+                )
+                for name in ("method_dataflow_E3", "interprocedural_dataflow_E4")
+            )
         else:
+            flow_limits = (
+                replace(limits, timeout=min(limits.timeout, deadline.remaining()))
+                if deadline is not None
+                else limits
+            )
             with phase(store.metrics if store else None, "dataflow"):
                 flows, coverage = analyze_dataflow(
                     app["methods"],
-                    limits,
+                    flow_limits,
                     store.cancel if store else None,
                     definition_summaries=(
                         results[item["sha256"]] for item in group["artifacts"]
@@ -1408,6 +1436,15 @@ def _build_apps(artifacts, results, snapshot, limits, mode, store, progress):
                 )
             app["findings"].extend(flows)
             app["coverage"].extend(coverage)
+            if deadline is not None and deadline.expired():
+                app["coverage"].append(
+                    stage(
+                        "analysis_time_budget",
+                        "PARTIAL",
+                        package,
+                        "Offline analysis time budget exhausted during dataflow",
+                    )
+                )
         build_findings(app, store)
         app["status"] = aggregate_status(app["coverage"])
         if store:

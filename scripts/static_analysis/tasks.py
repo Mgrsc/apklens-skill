@@ -31,6 +31,7 @@ DEFAULT_CONFIGURATION = {
     "max_total_mib": 512,
     "max_results": 50000,
     "timeout": 300,
+    "analysis_timeout": 1800,
     "memory_mib": None,
 }
 

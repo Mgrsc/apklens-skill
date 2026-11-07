@@ -1,4 +1,4 @@
-MODEL_VERSION = "5"
+MODEL_VERSION = "6"
 SOURCE_METHODS = {}
 
 for owner, category, signatures in (

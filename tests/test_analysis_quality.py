@@ -11,7 +11,7 @@ from scripts.static_analysis.assessment import (
     render_assessment,
     validate_assessment,
 )
-from scripts.static_analysis.common import stage
+from scripts.static_analysis.common import Limits, stage
 from scripts.static_analysis.reports import (
     close_report,
     load_report,
@@ -19,7 +19,12 @@ from scripts.static_analysis.reports import (
     query,
     summary,
 )
-from scripts.static_analysis.storage import APP_SECTIONS, AnalysisStore, Apps
+from scripts.static_analysis.storage import (
+    APP_SECTIONS,
+    EVIDENCE_SECTIONS,
+    AnalysisStore,
+    Apps,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT = "a" * 64
@@ -108,7 +113,10 @@ class AnalysisQualityTests(unittest.TestCase):
             sections = {section: app[section] for section in APP_SECTIONS}
             store.begin_app(app)
             for section, records in sections.items():
-                app[section].extend(records)
+                if section in EVIDENCE_SECTIONS and section != "findings":
+                    store.merge(app["id"], section, records, Limits())
+                else:
+                    app[section].extend(records)
             store.save_app(app)
         stored = {**report, "apps": Apps(store)}
         store.save_report(stored)
@@ -372,7 +380,7 @@ class AssessmentValidationTests(unittest.TestCase):
             }
         )
         self.assessment = prepare_assessment(self.report)
-        self.reviewed()["claims"] = [
+        self.reviewed()["claims"] += [
             {
                 "id": "path",
                 "type": "static_path",
@@ -386,7 +394,7 @@ class AssessmentValidationTests(unittest.TestCase):
             validate_assessment(self.report, self.assessment)["validation_status"],
             "PASS",
         )
-        self.assessment["applications"][0]["claims"][0]["limitations"] = ""
+        self.assessment["applications"][0]["claims"][1]["limitations"] = ""
         self.assertEqual(
             validate_assessment(self.report, self.assessment)["validation_status"],
             "FAILED",
@@ -404,7 +412,7 @@ class AssessmentValidationTests(unittest.TestCase):
         ]
         self.assessment = prepare_assessment(self.report)
         row = self.reviewed()
-        row["claims"] = [
+        row["claims"] += [
             {
                 "id": "grant",
                 "type": "snapshot_grant",
@@ -419,7 +427,7 @@ class AssessmentValidationTests(unittest.TestCase):
             validate_assessment(self.report, self.assessment)["validation_status"],
             "FAILED",
         )
-        row["claims"][0]["grant_scope"] = "shared_uid"
+        row["claims"][1]["grant_scope"] = "shared_uid"
         self.assertEqual(
             validate_assessment(self.report, self.assessment)["validation_status"],
             "PASS",

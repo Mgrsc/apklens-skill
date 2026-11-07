@@ -5,7 +5,7 @@ from .common import stable_id
 from .endpoints import host_matches
 from .privacy_models import PRECISE_CALL_SIGNALS, SENSITIVE_SIGNALS, call_signal
 
-RULE_VERSION = "4"
+RULE_VERSION = "5"
 CAPABILITIES = {
     "location": [
         "ACCESS_FINE_LOCATION",
@@ -99,7 +99,7 @@ SIGNAL_PATTERNS = {
     "accessibility_service": r"AccessibilityService",
     "notification_listener": r"NotificationListenerService",
     "device_admin": r"DeviceAdminReceiver",
-    "telemetry_event": r"(?:logEvent|trackEvent|captureEvent|captureException|reportEvent|recordEvent|sendEvent|onEvent|setUserId|setUserProperty)",
+    "telemetry_event": r"(?<![A-Za-z0-9_$])(?:logEvent|trackEvent|captureEvent|captureException|reportEvent|recordEvent|sendEvent|setUserId|setUserProperty)(?![A-Za-z0-9_$])|(?:com/umeng/analytics/MobclickAgent;->|com\.umeng\.analytics\.MobclickAgent\.)onEvent(?=\()",
     "location_api": r"(?:Landroid/location/|FusedLocationProviderClient|getLastKnownLocation)",
     "contacts_api": r"(?:ContactsContract|content://com\.android\.contacts)",
     "installed_apps_api": r"(?:getInstalledPackages|getInstalledApplications|queryUsageStats)",
@@ -110,6 +110,12 @@ SIGNAL_PATTERNS = {
 SIGNALS = {name: re.compile(pattern) for name, pattern in SIGNAL_PATTERNS.items()}
 SIGNAL_CACHE_ENTRIES = 8192
 SIGNAL_CACHE_TEXT_LENGTH = 1024
+TELEMETRY_INVOCATION = re.compile(
+    r"^L[^;]+;->(?:logEvent|trackEvent|captureEvent|captureException|reportEvent|recordEvent|sendEvent|setUserId|setUserProperty)\(|^Lcom/umeng/analytics/MobclickAgent;->onEvent\("
+)
+LOCATION_INVOCATION = re.compile(
+    r"^Landroid/location/LocationManager;->(?:getLastKnownLocation|getCurrentLocation|requestLocationUpdates|requestSingleUpdate)\(|^Landroid/location/Location;->(?:getLatitude|getLongitude|getAltitude|getAccuracy|getBearing|getSpeed)\(|^Lcom/google/android/gms/location/(?:FusedLocationProviderClient|FusedLocationProviderApi);->(?:getLastLocation|getCurrentLocation|requestLocationUpdates)\("
+)
 
 
 def signal_decisions(value, level):
@@ -119,6 +125,15 @@ def signal_decisions(value, level):
         for name, pattern in SIGNALS.items()
         if (pattern.search(value) or name == precise)
         and not (level == "E2" and name in PRECISE_CALL_SIGNALS and name != precise)
+        and not (
+            level == "E2"
+            and name in {"telemetry_event", "location_api"}
+            and not (
+                TELEMETRY_INVOCATION
+                if name == "telemetry_event"
+                else LOCATION_INVOCATION
+            ).match(value)
+        )
     )
 
 

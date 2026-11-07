@@ -145,6 +145,21 @@ class DiskBudgetExceeded(BudgetExceeded):
     pass
 
 
+class AnalysisDeadline:
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.started = time.monotonic()
+        self.exhausted = False
+
+    def remaining(self):
+        remaining = max(0.0, self.seconds - (time.monotonic() - self.started))
+        self.exhausted |= remaining == 0
+        return remaining
+
+    def expired(self):
+        return self.remaining() == 0
+
+
 def check_resources(cancel=None, budget=None):
     if cancel is not None and cancel.is_set():
         raise Cancelled("Analysis cancelled")

@@ -45,6 +45,101 @@ RECOMMENDATION_KEYS = frozenset(
 )
 PREREQUISITE_TYPES = frozenset({"dependency", "role", "reversibility"})
 PREREQUISITE_STATES = frozenset({"verified", "unverified"})
+CAPTURED_ROLES = (
+    "enabled_accessibility_services",
+    "enabled_notification_listeners",
+    "default_input_method",
+)
+INVENTORY_SAMPLE_LIMIT = 3
+
+
+def finding_key(finding):
+    kind = finding["type"]
+    category = finding.get("data_category")
+    return kind + ":" + category if category else kind
+
+
+def evidence_inventory(app, claims=None):
+    finding_ids = set()
+    evidence_levels = {}
+    for claim in claims or ():
+        finding_ids.update(claim.get("finding_ids", ()))
+        for identity in claim.get("evidence_ids", ()):
+            context = evidence_context(app, identity)
+            if context:
+                level = context[0].get("evidence_level", "E0")
+                evidence_levels[identity] = max(
+                    evidence_levels.get(identity, "E0"), level
+                )
+    for identity in finding_ids:
+        finding = record_by_id(app, "findings", identity)
+        if finding:
+            for evidence_id in finding.get("evidence_ids", ()):
+                evidence_levels[evidence_id] = max(
+                    evidence_levels.get(evidence_id, "E0"),
+                    finding.get("evidence_level", "E0"),
+                )
+    groups = {}
+    for section in ("findings", "endpoints"):
+        records = app.get(section, ()) if section == "findings" or groups else ()
+        for record in records:
+            key = (
+                finding_key(record) if section == "findings" else "endpoint_candidates"
+            )
+            item = groups.setdefault(
+                key,
+                {
+                    "key": key,
+                    "section": section,
+                    "records": 0,
+                    "highest_evidence_level": "E0",
+                    "record_id_sample": [],
+                    "record_ids_truncated": False,
+                    "covered": False,
+                },
+            )
+            level = record.get("evidence_level", "E1")
+            if level > item["highest_evidence_level"]:
+                item["highest_evidence_level"] = level
+                item["covered"] = False
+            item["records"] += 1
+            if len(item["record_id_sample"]) < INVENTORY_SAMPLE_LIMIT:
+                item["record_id_sample"].append(record["id"])
+            item["record_ids_truncated"] = item["records"] > INVENTORY_SAMPLE_LIMIT
+            references = (
+                record.get("evidence_ids", ())
+                if section == "findings"
+                else (evidence["id"] for evidence in record.get("evidence", ()))
+            )
+            if level == item["highest_evidence_level"] and (
+                section == "findings"
+                and record["id"] in finding_ids
+                or any(
+                    evidence_levels.get(identity, "") >= level
+                    for identity in references
+                )
+            ):
+                item["covered"] = True
+    if claims is None:
+        for item in groups.values():
+            item.pop("covered")
+    return [groups[key] for key in sorted(groups)]
+
+
+def source_statistics(report):
+    levels = Counter(
+        item.get("evidence_level", "unknown")
+        for app in report["apps"]
+        for item in app.get("capabilities", ())
+    )
+    return {
+        "input_kind": report["run"].get("input_kind"),
+        "capabilities": {
+            "unit": "capability_record",
+            "records": sum(levels.values()),
+            "by_evidence_level": dict(sorted(levels.items())),
+        },
+    }
 
 
 def application_identity(app):
@@ -84,6 +179,8 @@ def prepare_assessment(report, skill_revision=None):
                 {
                     "identity": application_identity(app),
                     "context": assessment_context(app),
+                    "evidence_inventory": evidence_inventory(app),
+                    "deferred_evidence": [],
                     "state": "pending" if app.get("artifacts") else "metadata_only",
                     "reason": ""
                     if app.get("artifacts")
@@ -100,7 +197,10 @@ def prepare_assessment(report, skill_revision=None):
 def record_by_id(app, section, identity):
     records = app.get(section, ())
     values = (
-        records.page(identity=identity) if isinstance(records, Records) else records
+        records.page(identity=identity)
+        if isinstance(records, Records)
+        and records.store.version >= INDEXED_STORE_VERSION
+        else records
     )
     return next((item for item in values if item.get("id") == identity), None)
 
@@ -254,6 +354,7 @@ def validate_recommendation(app, recommendation, claim_ids):
         errors.append("Recommendation prerequisites must be objects in a list")
         prerequisites = []
     verified = set()
+    seen = set()
     for item in prerequisites:
         kind, status = item.get("type"), item.get("status")
         if (
@@ -270,11 +371,23 @@ def validate_recommendation(app, recommendation, claim_ids):
             )
         elif status == "verified":
             verified.add(kind)
+        if isinstance(kind, str):
+            if kind in seen:
+                errors.append("Duplicate recommendation prerequisite type")
+            seen.add(kind)
     facts = _application_view(app)["facts"]
     installation = app.get("installation") or {}
-    sensitive_role = bool(installation.get("shared_user")) or any(
-        value is True for value in installation.get("special_access", {}).values()
+    special_access = installation.get("special_access") or {}
+    unknown_roles = any(
+        type(special_access.get(role)) is not bool for role in CAPTURED_ROLES
     )
+    sensitive_role = bool(installation.get("shared_user")) or any(
+        value is True for value in special_access.values()
+    )
+    if unknown_roles and "role" in verified:
+        errors.append("Role verification contradicts unknown captured role states")
+    if action == "uninstall" and unknown_roles and "role" not in verified:
+        errors.append("Uninstall requires review of unknown captured role states")
     if action == "uninstall" and (
         facts["system_classification"] is not False
         or sensitive_role
@@ -303,6 +416,7 @@ def validate_recommendation(app, recommendation, claim_ids):
 def validate_assessment(report, assessment):
     errors = []
     counts = Counter({state: 0 for state in sorted(REVIEW_STATES)})
+    evidence_counts = Counter({"covered": 0, "deferred": 0, "unreviewed": 0})
     if not isinstance(assessment, dict):
         errors.append("Assessment must be a JSON object")
         assessment = {}
@@ -385,6 +499,7 @@ def validate_assessment(report, assessment):
             errors.append(prefix + "claims must be a list")
             claims = []
         claim_ids = set()
+        valid_claims = []
         for claim in claims:
             if not isinstance(claim, dict):
                 errors.append(prefix + "invalid claim")
@@ -394,7 +509,59 @@ def validate_assessment(report, assessment):
                 if identity in claim_ids:
                     errors.append(prefix + "duplicate claim ID")
                 claim_ids.add(identity)
-            errors.extend(prefix + error for error in validate_claim(app, claim))
+            claim_errors = validate_claim(app, claim)
+            errors.extend(prefix + error for error in claim_errors)
+            if not claim_errors:
+                valid_claims.append(claim)
+        reviewed_inventory = evidence_inventory(app, valid_claims)
+        inventory = [
+            {key: value for key, value in item.items() if key != "covered"}
+            for item in reviewed_inventory
+        ]
+        if "evidence_inventory" in row and row["evidence_inventory"] != sanitized(
+            inventory
+        ):
+            errors.append(prefix + "derived evidence inventory was changed")
+        keys = {item["key"] for item in reviewed_inventory}
+        covered = {item["key"] for item in reviewed_inventory if item["covered"]}
+        deferred = {}
+        deferrals = row.get("deferred_evidence", [])
+        if not isinstance(deferrals, list):
+            errors.append(prefix + "deferred evidence must be a list")
+            deferrals = []
+        for item in deferrals:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"key", "reason"}
+                or not isinstance(item.get("key"), str)
+                or item["key"] not in keys
+                or not isinstance(item.get("reason"), str)
+                or not item["reason"].strip()
+            ):
+                errors.append(prefix + "invalid deferred evidence key or reason")
+                continue
+            key = item["key"]
+            if key in deferred or key in covered:
+                errors.append(
+                    prefix + "duplicate or already covered deferred evidence: " + key
+                )
+            deferred[key] = item["reason"]
+        for item in reviewed_inventory:
+            key = item["key"]
+            status = (
+                "covered"
+                if key in covered
+                else "deferred"
+                if key in deferred
+                else "unreviewed"
+            )
+            evidence_counts[status] += 1
+            if state == "reviewed" and status == "unreviewed":
+                errors.append(
+                    prefix
+                    + "evidence category requires a claim at its highest level or explicit deferral: "
+                    + key
+                )
         recommendations = row.get("recommendations", [])
         if not isinstance(recommendations, list):
             errors.append(prefix + "recommendations must be a list")
@@ -419,6 +586,8 @@ def validate_assessment(report, assessment):
     return {
         "validation_status": "FAILED" if errors else "PASS",
         "review_counts": dict(counts),
+        "evidence_review_counts": dict(evidence_counts),
+        "source_statistics": source_statistics(report),
         "outstanding_review": counts["pending"] + counts["deferred"],
         "unavailable_code": sum(not app.get("artifacts") for app in report["apps"]),
         "analysis_status": report["run"]["status"],
@@ -428,10 +597,13 @@ def validate_assessment(report, assessment):
 
 
 def markdown_text(value):
-    text = html.escape(str(value)).replace("\n", " ").replace("\r", " ")
-    for character in "\\`*_{}[]()#+-.!|":
-        text = text.replace(character, f"&#{ord(character)};")
-    return text
+    text = str(value).replace("\n", " ").replace("\r", " ")
+    return "".join(
+        f"&#{ord(character)};"
+        if character in "\\`*_{}[]()#+-.!|"
+        else html.escape(character)
+        for character in text
+    )
 
 
 def render_assessment(report, assessment, language="en"):
@@ -441,53 +613,115 @@ def render_assessment(report, assessment, language="en"):
             "Assessment validation failed; inspect validation errors before rendering"
         )
     labels = {
-        "en": (
-            "Application Assessment",
-            "Task",
-            "Analysis status",
-            "Review states",
-            "Outstanding review",
-            "Applications without APK",
-            "Static evidence and captured context only; no actual transmission or remediation safety is established.",
-            "Conditions",
-            "Impact",
-            "Verification",
-            "Recovery",
-        ),
-        "zh-CN": (
-            "逐应用评估",
-            "任务",
-            "分析状态",
-            "评估状态计数",
-            "待完成评估",
-            "没有 APK 的应用",
-            "结论限于静态证据与已捕获上下文；不代表实际传输或处置安全。",
-            "条件",
-            "影响",
-            "验证",
-            "恢复",
-        ),
+        "en": {
+            "title": "Application Assessment",
+            "task": "Task",
+            "analysis_status": "Analysis status",
+            "scope": "Conclusions and review scope",
+            "claims_summary": "Application groups with evidence claims: {claims}; Application groups marked reviewed: {reviewed}.",
+            "evidence_summary": "Application/category pairs: covered {covered}; explicitly deferred {deferred}; unreviewed {unreviewed}.",
+            "outstanding_summary": "Outstanding application assessments: {outstanding} (pending {pending}; deferred {deferred}); applications without APK: {missing}.",
+            "scope_note": "Evidence claims may address selected questions or captured permissions only. The reviewed state requires each available category to have a supported claim or explicit deferral; it does not establish exhaustive review or complete code coverage. Category counts are not question or claim counts.",
+            "limitations": "Static evidence and captured context only; no actual transmission or remediation safety is established. Validation PASS does not mean complete review.",
+            "focus": "Evidence conclusions and recommendations",
+            "no_conclusions": "No evidence conclusions or recommendations have been recorded; see the register for outstanding review and missing inputs.",
+            "register": "Remaining application register",
+            "register_summary": "Show {count} remaining application groups",
+            "register_note": "Full identities, artifact hashes and the original row order remain in the accompanying [assessment.json](assessment.json).",
+            "register_columns": "Application / group ID | User / version code | State | Reason",
+            "pending_reason": "Evidence has not been assessed; no conclusion or remediation recommendation is established.",
+            "statistics": "Full statistics and source details",
+            "statistics_summary": "Show authoritative counts and source statistics",
+            "review_states": "Review states",
+            "evidence_categories": "Evidence categories",
+            "facts": "Authoritative facts",
+            "source_statistics": "Source statistics",
+            "conditions": "Conditions",
+            "impact": "Impact",
+            "verification": "Verification",
+            "recovery": "Recovery",
+            "deferred_evidence": "Deferred evidence",
+            "prerequisite": "Prerequisite",
+        },
+        "zh-CN": {
+            "title": "逐应用评估",
+            "task": "任务",
+            "analysis_status": "分析状态",
+            "scope": "结论与核对范围",
+            "claims_summary": "已有证据结论：{claims} 个应用组；应用评估标记 reviewed：{reviewed} 个。",
+            "evidence_summary": "证据类别（按应用组／类别计）：已回应 {covered}；明确延期 {deferred}；未核对 {unreviewed}。",
+            "outstanding_summary": "待完成应用评估：{outstanding} 个（pending {pending}；deferred {deferred}）；没有 APK 的应用：{missing} 个。",
+            "scope_note": "已有证据结论可能只涉及选定问题或采集时的授权。reviewed 表示各个可用证据类别已有支持结论或明确延期，不代表所有位置已审完或代码覆盖完整。类别数不等于问题数或结论条数。",
+            "limitations": "结论限于静态证据与已捕获上下文；不代表实际传输或处置安全。校验 PASS 不等于完整审查。",
+            "focus": "重点结论与建议",
+            "no_conclusions": "尚未记录证据结论或处置建议；待核对范围和缺失输入见登记清单。",
+            "register": "其余应用登记",
+            "register_summary": "展开其余 {count} 个应用组",
+            "register_note": "完整身份、制品哈希和原始行顺序保留在同目录的 [assessment.json](assessment.json)。",
+            "register_columns": "应用／应用组 ID | 用户／版本号 | 状态 | 原因",
+            "pending_reason": "尚未核对证据；未形成结论或处置建议。",
+            "statistics": "完整统计与来源",
+            "statistics_summary": "展开权威计数与源数据统计",
+            "review_states": "评估状态计数",
+            "evidence_categories": "证据类别核对",
+            "facts": "权威事实",
+            "source_statistics": "源数据统计",
+            "conditions": "条件",
+            "impact": "影响",
+            "verification": "验证",
+            "recovery": "恢复",
+            "deferred_evidence": "延期证据",
+            "prerequisite": "前提",
+        },
     }[language]
+    focus, remaining = [], []
+    for row in assessment["applications"]:
+        target = (
+            focus
+            if row["claims"]
+            or row["recommendations"]
+            or row.get("deferred_evidence")
+            or row["state"] == "reviewed"
+            else remaining
+        )
+        target.append(row)
+    counts = validation["review_counts"]
     lines = [
-        "# " + labels[0],
+        "# " + labels["title"],
         "",
-        f"{labels[1]}: `{assessment['run_id']}`",
-        f"{labels[2]}: `{validation['analysis_status']}`",
-        f"{labels[3]}: `{validation['review_counts']}`",
-        f"{labels[4]}: {validation['outstanding_review']}; {labels[5]}: {validation['unavailable_code']}",
+        f"{labels['task']}: `{assessment['run_id']}`",
+        f"{labels['analysis_status']}: `{validation['analysis_status']}`",
         "",
-        labels[6],
+        "## " + labels["scope"],
         "",
-        "```json",
-        json.dumps(assessment["facts"], ensure_ascii=False, indent=2),
-        "```",
+        labels["claims_summary"].format(
+            claims=sum(bool(row["claims"]) for row in focus),
+            reviewed=counts["reviewed"],
+        ),
+        "",
+        labels["evidence_summary"].format(**validation["evidence_review_counts"]),
+        "",
+        labels["outstanding_summary"].format(
+            outstanding=validation["outstanding_review"],
+            pending=counts["pending"],
+            deferred=counts["deferred"],
+            missing=validation["unavailable_code"],
+        ),
+        "",
+        labels["scope_note"],
+        "",
+        labels["limitations"],
+        "",
+        "## " + labels["focus"],
         "",
     ]
-    for row in assessment["applications"]:
+    if not focus:
+        lines.extend([labels["no_conclusions"], ""])
+    for row in focus:
         identity = row["identity"]
         lines.extend(
             [
-                f"## {markdown_text(identity['package'] or identity['app_id'])}",
+                f"### {markdown_text(identity['package'] or identity['app_id'])}",
                 "",
                 markdown_text(identity),
                 "",
@@ -505,14 +739,78 @@ def render_assessment(report, assessment, language="en"):
             )
             if claim.get("limitations"):
                 lines.extend([markdown_text(claim["limitations"]), ""])
-        for recommendation in row["recommendations"]:
+        for item in row.get("deferred_evidence", ()):
             lines.extend(
                 [
-                    f"- `{recommendation['action']}`; {labels[7]}: {markdown_text('; '.join(recommendation['conditions']))}",
-                    f"  - {labels[8]}: {markdown_text(recommendation['impact'])}",
-                    f"  - {labels[9]}: {markdown_text(recommendation['verification'])}",
-                    f"  - {labels[10]}: {markdown_text(recommendation['recovery'])}",
+                    f"- {labels['deferred_evidence']}: {markdown_text(item['key'])}; {markdown_text(item['reason'])}",
                     "",
                 ]
             )
+        for recommendation in row["recommendations"]:
+            lines.extend(
+                [
+                    f"- `{recommendation['action']}`; {labels['conditions']}: {markdown_text('; '.join(recommendation['conditions']))}",
+                    f"  - {labels['impact']}: {markdown_text(recommendation['impact'])}",
+                    f"  - {labels['verification']}: {markdown_text(recommendation['verification'])}",
+                    f"  - {labels['recovery']}: {markdown_text(recommendation['recovery'])}",
+                    "",
+                ]
+            )
+            for prerequisite in recommendation.get("prerequisites", ()):
+                lines.extend(
+                    [
+                        f"  - {labels['prerequisite']}: `{prerequisite['type']}` / `{prerequisite['status']}`; {markdown_text(prerequisite['basis'])}",
+                        "",
+                    ]
+                )
+    if remaining:
+        lines.extend(
+            [
+                "## " + labels["register"],
+                "",
+                labels["register_note"],
+                "",
+                "<details>",
+                "<summary>"
+                + labels["register_summary"].format(count=len(remaining))
+                + "</summary>",
+                "",
+                "| " + labels["register_columns"] + " |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        for row in remaining:
+            identity = row["identity"]
+            lines.append(
+                f"| {markdown_text(identity['package'])} / {markdown_text(identity['app_id'])} "
+                f"| {markdown_text(identity['user'])} / {markdown_text(identity['version_code'])} "
+                f"| `{row['state']}` | {markdown_text(row['reason'] or labels['pending_reason'])} |"
+            )
+        lines.extend(["", "</details>", ""])
+    lines.extend(
+        [
+            "## " + labels["statistics"],
+            "",
+            "<details>",
+            "<summary>" + labels["statistics_summary"] + "</summary>",
+            "",
+            f"{labels['review_states']}: `{counts}`",
+            f"{labels['evidence_categories']}: `{validation['evidence_review_counts']}`",
+            "",
+            "### " + labels["facts"],
+            "",
+            "```json",
+            json.dumps(assessment["facts"], ensure_ascii=False, indent=2),
+            "```",
+            "",
+            "### " + labels["source_statistics"],
+            "",
+            "```json",
+            json.dumps(validation["source_statistics"], ensure_ascii=False, indent=2),
+            "```",
+            "",
+            "</details>",
+            "",
+        ]
+    )
     return sanitized("\n".join(lines))

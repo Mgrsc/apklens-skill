@@ -464,7 +464,12 @@ class Analyzer:
         data = self.join(*values)
         current = self.read(receiver, state)
         if signature in SOURCE_METHODS:
-            return self.source(SOURCE_METHODS[signature], node)
+            source = self.source(SOURCE_METHODS[signature], node)
+            return (
+                self.allocate(state, result_type, node, source)
+                if result_type == "Ljava/util/Map;"
+                else source
+            )
         if signature in AUDIO_READS:
             length = (
                 arguments[1]
@@ -584,6 +589,7 @@ class Analyzer:
                 key = arguments[0].constants
                 selected = []
                 for obj in self.objects(receiver, state):
+                    selected.append(obj["value"])
                     selected.extend(
                         [
                             obj["fields"].get(key[0], EMPTY),
@@ -595,9 +601,57 @@ class Analyzer:
                 return self.advance(self.join(*selected, Value(receiver.sources)), node)
             if name == "toString" and not parameters:
                 return self.snapshot(current, node)
+            if (
+                owner
+                in {
+                    "Ljava/util/Map;",
+                    "Ljava/util/HashMap;",
+                    "Ljava/util/LinkedHashMap;",
+                }
+                and name == "entrySet"
+                and result_type == "Ljava/util/Set;"
+                and not parameters
+            ):
+                view = self.allocate(state, result_type, node)
+                for obj in self.objects(view, state):
+                    obj["map_values"] = receiver
+                    obj["map_steps"] = (node,)
+                return view
             if name == "<init>":
                 self.attach(receiver, self.advance(data, node), state)
                 return EMPTY
+        if signature == "Ljava/util/Map$Entry;->getValue()Ljava/lang/Object;":
+            selected = []
+            for obj in self.objects(receiver, state):
+                if "map_values" in obj:
+                    value = self.read(obj["map_values"], state)
+                    for step in obj["map_steps"]:
+                        value = self.snapshot(value, step)
+                    selected.append(value)
+            if not selected:
+                self.gap("Map entry value has no modeled backing map", node)
+            return self.snapshot(self.join(*selected), node)
+        if (
+            owner
+            in {"Ljava/util/Set;", "Ljava/util/Collection;", "Ljava/util/Iterator;"}
+            and (name, result_type)
+            in {
+                ("iterator", "Ljava/util/Iterator;"),
+                ("next", "Ljava/lang/Object;"),
+            }
+            and not parameters
+        ):
+            views = [
+                obj for obj in self.objects(receiver, state) if "map_values" in obj
+            ]
+            if views:
+                result = self.allocate(state, result_type, node)
+                for obj in self.objects(result, state):
+                    obj["map_values"] = self.join(
+                        *(view["map_values"] for view in views)
+                    )
+                    obj["map_steps"] = (*views[0]["map_steps"], node)
+                return result
         if owner in {
             "Ljava/util/List;",
             "Ljava/util/ArrayList;",
@@ -1074,6 +1128,8 @@ class Analyzer:
                 obj["fields"].clear()
                 obj["elements"].clear()
                 obj["value"] = EMPTY
+                obj.pop("map_values", None)
+                obj.pop("map_steps", None)
         return EMPTY
 
     def cache_method(self, identity, method):

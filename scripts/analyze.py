@@ -15,6 +15,7 @@ from pathlib import Path
 
 from static_analysis import ENGINE_VERSION, SCHEMA_VERSION
 from static_analysis.common import (
+    AnalysisDeadline,
     AnalysisError,
     Cancelled,
     DiskBudgetExceeded,
@@ -125,6 +126,11 @@ def build_parser():
     scan.add_argument("--max-total-mib", type=positive_int)
     scan.add_argument("--max-results", type=positive_int)
     scan.add_argument("--timeout", type=positive_int)
+    scan.add_argument(
+        "--analysis-timeout",
+        type=positive_int,
+        help="Offline analysis budget in seconds (default 1800); stop new work on expiry, then preserve all targets and export; collection, verification, in-flight artifacts and finalization may extend wall time",
+    )
     scan.add_argument(
         "--memory-mib",
         type=positive_int,
@@ -240,6 +246,7 @@ def scan(args):
     resume_store = None
     results = None
     task_budget = None
+    deadline = None
     resources = ExitStack()
     status = "FAILED"
     metrics = PerformanceMetrics(args.output, run_id, configuration)
@@ -252,7 +259,11 @@ def scan(args):
             and any(result.get("resource_limited") for result in results.values())
         ):
             return "memory_budget"
-        return "cancelled" if cancel.is_set() else None
+        if cancel.is_set():
+            return "cancelled"
+        return (
+            "analysis_timeout" if deadline is not None and deadline.exhausted else None
+        )
 
     def progress(event):
         kind = event["event"]
@@ -452,6 +463,7 @@ def scan(args):
         cache_directory = (
             None if args.no_cache else (args.cache_dir or args.output.parent / "cache")
         )
+        deadline = AnalysisDeadline(args.analysis_timeout)
         with metrics.measure("artifact_analysis"):
             results = analyze_many(
                 artifacts,
@@ -467,6 +479,7 @@ def scan(args):
                 source_tool=args.jadx,
                 metrics=metrics,
                 executor_kind=args.executor,
+                deadline=deadline,
             )
         if cancel.is_set():
             raise Cancelled("Artifact analysis interrupted; checkpoints preserved")
@@ -475,6 +488,15 @@ def scan(args):
             progress({"event": "decompilation_started"})
             for identity in results:
                 task_budget.check()
+                if deadline.expired():
+                    stages.append(
+                        stage(
+                            "source_view",
+                            "DEFERRED",
+                            reason="Offline analysis time budget exhausted; remaining decompilation was not started",
+                        )
+                    )
+                    break
                 result = results[identity]
                 if result.get("source_view_complete"):
                     continue
@@ -498,7 +520,10 @@ def scan(args):
                                 artifact,
                                 args.output / "sources" / identity,
                                 args.jadx,
-                                limits,
+                                replace(
+                                    limits,
+                                    timeout=min(limits.timeout, deadline.remaining()),
+                                ),
                                 cancel,
                             )
                             for key in ("endpoints", "signals", "stages"):
@@ -538,10 +563,22 @@ def scan(args):
                 args.mode,
                 store=store,
                 progress=progress,
+                deadline=deadline,
+            )
+        if deadline.exhausted:
+            stages.append(
+                stage(
+                    "analysis_time_budget",
+                    "PARTIAL",
+                    reason="Offline analysis time budget exhausted; retained facts and all registered targets were preserved; unfinished work remains unknown",
+                    analysis_timeout_seconds=args.analysis_timeout,
+                )
             )
         all_stages = chain(stages, (item for app in apps for item in app["coverage"]))
         if cancel.is_set():
             status = "CANCELLED"
+        elif deadline.exhausted:
+            status = "PARTIAL"
         elif not apps or not any(app["manifests"] for app in apps):
             status = "FAILED"
         else:
@@ -572,6 +609,7 @@ def scan(args):
                 "jobs": plan["jobs"],
                 "resumed_from": str(args.resume.resolve()) if args.resume else None,
                 "stop_reason": stop_reason(),
+                "analysis_timeout_seconds": args.analysis_timeout,
                 "resource_plan": plan,
             },
             "stages": stages,

@@ -101,7 +101,7 @@ python3 scripts/analyze.py scan \
 
 - Stop the original task before resuming. Existing reports and artifacts are never overwritten. SQLite rollback recovery, when required after a crash, runs on a private temporary database copy in the new output directory; allow additional free space for that copy.
 - Compatible `COMPLETE` and `PARTIAL` artifact checkpoints are reused. `FAILED`, `CANCELLED`, missing, and memory-interrupted checkpoints are retried. Add `--retry-incomplete` to retry other `PARTIAL` results; this verifies saved stage facts even if a previous import incorrectly recorded completion metadata. Source tasks remain unchanged.
-- Mode, executor, coverage budgets, requested concurrency, and explicit memory budget inherit from `snapshot.json` unless overridden. Changing semantic limits or mode invalidates the corresponding checkpoint/cache identity and triggers parsing again. An automatic memory budget is recalculated for the current host and does not invalidate compatible facts. Snapshots without an executor use `thread`; executor/concurrency changes do not alter semantic cache identity. Engine 1.3.0 changes endpoint selection, so earlier semantic checkpoints are reparsed even though their databases remain readable.
+- Mode, executor, coverage budgets, requested concurrency, and explicit memory budget inherit from `snapshot.json` unless overridden. Changing semantic limits or mode invalidates the corresponding checkpoint/cache identity and triggers parsing again. An automatic memory budget is recalculated for the current host and does not invalidate compatible facts. Snapshots without an executor use `thread`; executor/concurrency changes do not alter semantic cache identity. Engine 1.3.1 adds resource-pair decoding and rules 5 tighten direct-call candidates, so earlier semantic checkpoints are reparsed even though their databases remain readable.
 - External executables are never restored as implicit execution instructions. Pass `--jadx` explicitly when supplemental decompilation must be rerun. Changing the selected jadx path prevents reuse of completed supplemental results.
 - A collection-only task can be passed to `--resume`; without a database, artifacts are parsed normally. `--snapshot` reuses acquisition only and does not import prior parsing checkpoints.
 - Tasks created by older versions without `snapshot.json` cannot use this recovery entrypoint. Supply their local base/split APKs with repeated `--apk` and point `--cache-dir` to a known existing cache. That path creates fresh input snapshots; device state and partial parse results absent from durable outputs cannot be reconstructed from APKs.
@@ -231,11 +231,14 @@ Existing output directories are never overwritten. Historical reports, snapshots
 
 ## Resources and Caching
 
+`--analysis-timeout` defaults to 1800 seconds and is inherited from saved configuration unless overridden. It starts after input collection/verification and preflight. On expiry, no new artifacts or decompilation are dispatched, remaining dataflow receives only the remaining time, and unstarted work is deferred. Already dispatched artifacts retain their own `--timeout`; target aggregation, persistence and exports finish afterward, so this is not a hard total wall-clock limit. The partial report records `stop_reason: analysis_timeout`, preserving every registered target and retained fact. A new-directory resume with `--retry-incomplete` can retry deferred artifacts; do not repeat a full scan automatically. This scheduling budget does not alter the semantic cache identity. AI review has a separate [scope and stopping rule](user-advice.md#review-scope-and-stopping-rules).
+
 ```sh
 python3 scripts/analyze.py scan \
   --apk /path/to/base.apk \
   --jobs 2 \
   --timeout 300 \
+  --analysis-timeout 1800 \
   --max-entry-mib 128 \
   --max-total-mib 512 \
   --max-results 50000 \

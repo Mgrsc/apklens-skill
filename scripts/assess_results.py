@@ -4,11 +4,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from static_analysis.assessment import (
-    prepare_assessment,
+from static_analysis.advice_reporting import (
     render_assessment,
-    validate_assessment,
+    validate_delivery,
 )
+from static_analysis.assessment import prepare_assessment
 from static_analysis.common import (
     AnalysisError,
     atomic_json,
@@ -47,13 +47,16 @@ def main():
             if args.action == "prepare"
             else read_json(args.assessment)
         )
-        result = validate_assessment(report, assessment)
-        if result["validation_status"] != "PASS":
+        result = validate_delivery(report, assessment)
+        if (
+            result["validation_status"] != "PASS"
+            or result["reporting"]["status"] == "invalid"
+        ):
             print(json.dumps(result, ensure_ascii=True, indent=2))
             return 1
         if args.action != "validate":
             rendered = (
-                render_assessment(report, assessment, args.language)
+                render_assessment(report, assessment, args.language, validation=result)
                 if args.action == "render"
                 else None
             )
@@ -66,9 +69,9 @@ def main():
             result["files"]["delivery-summary.json"] = str(
                 args.output / "delivery-summary.json"
             )
-            if rendered is not None:
-                atomic_text(args.output / "user-advice.md", rendered)
-                result["files"]["user-advice.md"] = str(args.output / "user-advice.md")
+            for name, text in (rendered or {}).items():
+                atomic_text(args.output / name, text)
+                result["files"][name] = str(args.output / name)
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     except (

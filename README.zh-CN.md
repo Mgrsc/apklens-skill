@@ -52,9 +52,10 @@ AI 会通过 [online-static-analysis/SKILL.md](online-static-analysis/SKILL.md) 
 
 AI 通过 `scripts/assess_results.py` 在独立目录生成的评估产物：
 
-- `assessment.json`：覆盖全部应用组的评估账本，记录证据核查、延期原因与处置前提。
-- `delivery-summary.json`：确定性记录分析／审查状态、停止原因及已记录结论／建议数量，最终完成度说明以此为依据；准备和渲染时生成，校验时以 `delivery_summary` 返回。
-- `user-advice.md`：经校验生成的用户处置建议报告，包含核对范围、证据结论、处置建议（`retain` / `restrict` / `uninstall` / `disable` / `defer`）及完整登记统计。
+- `assessment.json`：覆盖全部应用组的评估账本，记录证据核查、延期原因、处置前提及可选的源绑定报告编排，明确问题组与常规记录的去向。
+- `delivery-summary.json`：确定性记录分析／审查状态、停止原因、已记录结论／建议数量及独立的报告编排状态，最终完成度说明以此为依据；准备和渲染时生成，校验时以 `delivery_summary` 返回。
+- `user-advice.md`：简明呈现本次结论、处理重点和选定的问题卡片，不因应用已审就逐项展开；全量登记、证据引用和统计保留在链接的账本与交付摘要中。
+- `report-details.md`：按需生成较大问题组的完整成员及首页以外的问题详情，保留适用条件与重要差异；没有编排的旧账本只提供明确标注的未编排详情，不猜测重点。
 
 具体组件候选、未细分厂商引用和地址引用分开呈现。基础库不代表广告或统计，只有域名也不能证明集成 SDK。已明确的文档／政策／schema 引用保留在原始清单，但不进入遥测候选视图。E2 记录保留指令证据，快照独有授权不再冒充 Manifest 声明。版本语义和旧数据未知项见[证据与覆盖](references/evidence-and-coverage.md)。
 

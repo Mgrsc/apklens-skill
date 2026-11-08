@@ -6,9 +6,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.static_analysis.advice_reporting import render_assessment
 from scripts.static_analysis.assessment import (
     prepare_assessment,
-    render_assessment,
     validate_assessment,
 )
 from scripts.static_analysis.common import Limits, stage
@@ -27,6 +27,12 @@ from scripts.static_analysis.storage import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def rendered_text(report, assessment, language="en"):
+    return "\n".join(render_assessment(report, assessment, language).values())
+
+
 ARTIFACT = "a" * 64
 
 
@@ -267,9 +273,7 @@ class AssessmentValidationTests(unittest.TestCase):
         self.assertEqual(result["validation_status"], "PASS")
         self.assertEqual(result["analysis_status"], "PARTIAL")
         self.assertEqual(result["unavailable_code"], 1)
-        self.assertIn(
-            "没有 APK", render_assessment(self.report, self.assessment, "zh-CN")
-        )
+        self.assertIn("没有 APK", rendered_text(self.report, self.assessment, "zh-CN"))
 
     def test_omission_duplicates_and_identity_changes_are_rejected(self):
         for operation in ("omit", "duplicate", "version", "facts"):
@@ -361,7 +365,7 @@ class AssessmentValidationTests(unittest.TestCase):
         self.report["apps"][0]["package"] = injected
         self.assessment = prepare_assessment(self.report)
         self.reviewed()["reason"] = injected
-        text = render_assessment(self.report, self.assessment)
+        text = rendered_text(self.report, self.assessment)
         self.assertNotIn("![remote]", text)
         self.assertNotIn("<script>", text)
         self.assertNotIn("https://example.test", text)

@@ -487,6 +487,10 @@ class EndpointCollector:
 def redact_text(value):
     def replace(match):
         candidate = match.group()
+        if candidate.endswith(("?", "#")) and value.startswith(
+            "<redacted>", match.end()
+        ):
+            return candidate
         suffix = ""
         if "?" in candidate:
             candidate = candidate.split("?", 1)[0]

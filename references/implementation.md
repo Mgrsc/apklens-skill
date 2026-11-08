@@ -19,6 +19,7 @@ SKILL.md
   -> scripts/query_results.py
   -> scripts/export_report.py
   -> scripts/assess_results.py -> static_analysis/assessment.py
+                             -> static_analysis/advice_reporting.py
 ```
 
 | File | Ownership |
@@ -37,7 +38,8 @@ SKILL.md
 | `method_selection.py` | Bounded candidate admission and source/network neighborhoods with category/DEX rotation |
 | `dataflow.py` | Bounded path states, object/field/collection propagation, modeled calls, network paths and explicit gaps |
 | `facts.py` | Authoritative app-scope counts, SDK units, permission origins, input coverage and review reasons |
-| `assessment.py` / `assess_results.py` | Full application register, derived category checklist and source statistics, reference/role validation and advice rendering; no claim of semantic proof |
+| `assessment.py` | Full application register, derived category checklist and source statistics, evidence/reference/role validation; no claim of semantic proof |
+| `advice_reporting.py` / `assess_results.py` | Source-bound editorial references, complete issue/routine routing, separate reporting status, grouped main/detail rendering and new-directory delivery; no automatic severity or semantic proof |
 | `manifest.py` | Permission declarations, components, application configurations, unparsed resource references |
 | `endpoints.py` | Endpoint extraction, bounded decoding, normalization, provenance, limited redaction |
 | `evidence.py` | Primitive evidence strength, bounded highest-witness retention, and shared memory/SQLite merge policy |
@@ -66,7 +68,7 @@ The online bootstrap entry clones code and documentation from `https://github.co
 6. When `decompile` mode and jadx are specified, run supplemental decompilation sequentially, scanning generated Java/Kotlin text for file and line matches; this supplements base analysis without upgrading to E3/E4 dataflow.
 7. Aggregate by application identity using per-record SQLite merges, attaching permission snapshots, capabilities, findings, and coverage. Persist bounded method/field facts even when they match no rule. Analyze methods on demand within one application, including its supplied splits, using bounded E3/E4 models. Commit paths, compact application views, evidence references and domain projections in the same transaction as finalized facts; never link incompatible package/version groups.
 8. Commit finalized report metadata. Generate the compatible JSON export incrementally, and project bounded summaries/Markdown and disk-deduplicated domains. Follow-up queries prefer SQLite facts without re-scanning or whole-report loading.
-9. Prepare every application group in a separate assessment register with a bounded evidence-category inventory. The AI inspects source records, records claims or specific category deferrals, validates references and captured role states, then renders advice with source capability levels and prerequisite statuses/bases. Validation does not establish complete review, truthful free text, safe device changes or runtime behavior.
+9. Prepare every application group in a separate assessment register with a bounded evidence-category inventory. The AI inspects source records, records claims or specific category deferrals, validates references and captured role states, then renders concise application sections with findings, uncertainties, conditional actions and prerequisite statuses/bases. Full identities, source statistics and outstanding records remain in the linked ledger and delivery summary rather than being copied into advice appendices. Validation does not establish complete review, truthful free text, safe device changes or runtime behavior.
 
 ## Performance Tradeoffs
 

@@ -16,7 +16,7 @@ python3 scripts/assess_results.py render TASK/analysis.sqlite3 \
   --output TASK/assessment-final --language zh-CN
 ```
 
-Omit `--skill-revision` when it is not verifiable; do not invent a commit. Both preparation and rendering require new output directories and preserve source reports. Fill the draft before validating and rendering. Rendering saves the validated `assessment.json` and derived `user-advice.md`; link both in the final response. Rendering an untouched draft is permitted but explicitly shows outstanding review, not a finished assessment. JSON reports are also accepted within the existing 256 MiB input limit; prefer SQLite for large tasks.
+Omit `--skill-revision` when it is not verifiable; do not invent a commit. Both preparation and rendering require new output directories and preserve source reports. Fill the evidence register first, run validation to obtain reporting reference keys, complete the optional `reporting` plan described below, and validate again before rendering. Rendering saves the validated `assessment.json`, `user-advice.md` and, when needed, `report-details.md`; deliver the main report and link the ledger. Rendering an untouched draft is permitted but explicitly shows outstanding review and missing editorial planning, not a finished assessment. JSON reports are also accepted within the existing 256 MiB input limit; prefer SQLite for large tasks.
 
 Preparation creates one row per application group, including targets without APKs. Preserve `schema_version`, `run_id`, `producer`, `facts`, each `identity`, captured `context` and derived `evidence_inventory`. The source report is authoritative for counts and identity; assessment IDs do not transfer to another task. Context provides installation state, sensitive candidate reasons, counts and coverage without expanding all raw evidence. Review all rows, then query exact findings, evidence and coverage as needed. Top 20, SDK matches and telemetry labels are not scope filters.
 
@@ -35,11 +35,71 @@ Preparation and rendering also save `delivery-summary.json`; validation returns 
 
 `delivery_summary` is authoritative for delivery; same-named top-level validation fields are compatibility views derived from the same counters. `claim_count` and `application_groups_with_claims` count valid source-supported claims, and `recommendation_count` counts individually valid recommendations permitted by the row's review state and referencing valid claims. Invalid entries remain visible through validation errors and are excluded from these counts, including when validation is FAILED.
 
-The advice starts with a readable scope summary, followed by recorded conclusions, their limitations, recommendations and prerequisites. Rows with claims, recommendations, category deferrals or a `reviewed` state appear first, regardless of their original register order. Remaining groups stay in a collapsible register with group ID, package, user, version, state and reason. Full facts and source statistics follow in a separate collapsible section. The complete identities, artifact hashes and original row order remain in the accompanying `assessment.json`.
+The advice opens with a brief review scope, then conclusions, priorities, selected issue cards and scope/source links. Issues are selected explicitly for user decisions rather than expanded from application review states. Routine reviewed rows do not produce cards. Main-page groups with multiple applications link to their complete member details; groups placed in details are disclosed through the total issue count and details entry. A single-application main group is explained on the main page. Details with multiple sections include a complete linked contents list with member identities/counts. Each full finding/action body has one destination; the overview only indexes it. Conditional actions retain impact, verification/recovery and prerequisite checks beside their instructions.
+
+Version and Android user identify every displayed member; a record ID is shown when visible identities collide. An optional row-level `display_name` supplies an author-verified application name; it must be nonempty text and never replaces package/version/user identity. Older rows without it use their package. The validator checks its shape, not the truth of the name; never infer a name or business purpose from a namespace.
+
+Do not reproduce the full application register, raw JSON facts, evidence-category counters, SDK/permission statistics, AppOps inventories, evidence-level glossary or a duplicate recommendations table in `user-advice.md`. Full identities, artifact hashes, evidence IDs, review states and original row order remain in `assessment.json`; exact completion counters remain in `delivery-summary.json`. The advice links both files. Identical claim text of the same type and scope may be displayed once, but different limitations or permission states must remain visible; every original claim and reference stays in the ledger. No display limit may silently discard a substantive conclusion.
 
 The summary separates groups with nonempty claims from groups marked `reviewed`. A selected question or captured permission claim does not complete the application assessment. Evidence totals remain application/category pairs from validation: multiple claims can address one category, while a snapshot grant does not itself cover a code-evidence category. Do not label category totals as question or claim counts. A `reviewed` group may still have explicit category deferrals; it never implies exhaustive code coverage or observed execution.
 
-Rendering derives this presentation without editing the register, source report, review states or evidence counts. When no conclusions or recommendations exist, say so rather than inventing a result. Markdown viewers without collapsible-section support still receive the full text; all groups and reasons remain in the file.
+Rendering derives this presentation without editing the register, source report, review states or evidence counts. When no conclusions or recommendations exist, state each absence explicitly rather than inventing a result. Missing APKs and outstanding review are disclosed briefly, with complete per-target details in the ledger. A checked prerequisite is an author-recorded check, not a renderer guarantee of safety or recovery. Rendering does not correct unsupported historical prose: inspect and amend such claims in a new ledger before publishing a revised assessment.
+
+## Reporting Plan
+
+The optional top-level `reporting` object has its own `schema_version: 1`. It changes presentation, not evidence or the assessment schema. Complete it for a curated user delivery; it is not required to read or validate historical registers. Run `validate` after completing the evidence content. Its `reporting` diagnostics return the current `source_key`, `available_references`, `unassigned_references`, counts and errors. Copy reference keys from these diagnostics; do not guess hashes or use array positions.
+
+```json
+{
+  "reporting": {
+    "schema_version": 1,
+    "source_key": "SOURCE_KEY_FROM_VALIDATION",
+    "groups": [
+      {
+        "id": "optional-access",
+        "title": "Review optional access",
+        "summary": "A recorded capability warrants a conditional access decision",
+        "reason": "This affects the user's requested privacy decision",
+        "kind": "action",
+        "placement": "main",
+        "refs": [
+          {"app_id": "APP_ID", "kind": "claim", "key": "CLAIM_ID"},
+          {"app_id": "APP_ID", "kind": "recommendation", "key": "RECOMMENDATION_KEY_FROM_VALIDATION"}
+        ]
+      }
+    ],
+    "routine": [
+      {
+        "reason": "This supported library clue does not establish a separate user decision",
+        "refs": [{"app_id": "APP_ID", "kind": "claim", "key": "OTHER_CLAIM_ID"}]
+      }
+    ]
+  }
+}
+```
+
+Replace all example IDs and keys with actual diagnostic values. Groups require exactly `id`, `title`, `summary`, `reason`, `kind`, `placement` and nonempty `refs`. Text fields must be nonempty. IDs match `[a-z][a-z0-9-]{0,63}` and are unique; they provide explicit document anchors. Array order sets reading order. `kind` is `action` for a group containing a validated device-change recommendation (`retain_restrict`, `uninstall`, `disable_optional`), or `attention` for an important finding, retain warning or decision-relevant gap. An attention group cannot hide a device-change recommendation. `placement` is `main` or `details`. Explain selection and placement in `reason`; do not turn engine scores into severity or invent summary facts or instructions outside the ledger.
+
+Each reference requires `app_id`, `kind` and `key`, except `review_scope`, which omits `key`:
+
+| Kind | Source key |
+|---|---|
+| `claim` | Row-local claim ID |
+| `recommendation` | Stable content key returned by validation, bound to this application |
+| `deferred_category` | Explicit `deferred_evidence` category key |
+| `review_scope` | Application state/reason; available only for a nonempty recorded reason other than the generic missing-APK reason |
+
+Every claim, unique recommendation content record and explicit category deferral needs exactly one primary destination: a group or a `routine` entry with nonempty `reason` and `refs`. A routine entry may cover multiple records/applications with the same actual reason. Device-change recommendations cannot be routine. Empty reviewed applications need no synthetic routine records. Review-scope references are optional; general pending/missing-code state remains in scope counts. Duplicate assignments, unknown references, stale source bindings and invalid groups fail reporting validation. Required unassigned references are returned for correction.
+
+Recommendations can depend on claims assigned elsewhere; this does not duplicate primary ownership. Rendering brings those supporting claims and their limitations into the action body. Identical duplicate recommendations share one content reference, retain all original occurrences and counts, and display once. Recommendation content changes invalidate its key. The source key binds the source task status/stop reason and all ledger content except `reporting`; edits require reconfirming the plan against the newly returned key.
+
+Group by a concrete question, not a vendor, SDK label, permission count or matching action name. Complete instructions merge only when findings, permission scopes, limitations, conditions, impact, verification/recovery, prerequisites and relevant captured context match. Otherwise variants retain their members and differences. Every affected member remains reachable; no Top N or display cap silently drops a finding. Routine records are not a safety allowlist. Deferred work belongs on the report only when resolving it can change an identified decision.
+
+The delivery summary adds `reporting_status` (`missing`, `ready`, `invalid`) and `reporting_counts`. These counts describe selected issue groups, main selections, groups with detail bodies, action/attention groups, distinct affected application groups and routine references. A main selection with multiple members has its full body in details, so main/detail counts are not a partition. These fields never change the meaning of `review_complete`, claim/recommendation counts or category coverage. Evidence `validation_status` and reporting status remain separate; CLI validation/rendering exits nonzero if either evidence fails or a supplied plan is invalid. Resolve `reporting.errors` even when evidence status is PASS.
+
+Without a plan, historical evidence remains validatable. Rendering makes a conservative main report and, only for actual claims, recommendations or explicit category deferrals, uncurated details. Empty reviewed/deferred rows are not expanded. It does not guess which existing findings are routine. A supplied invalid plan blocks rendering before the output directory is created; there is no silent fallback. `prepare` creates an unplanned register. No detail file or link is emitted when no detail body exists. Source files and historical ledgers remain unchanged.
+
+Source/reference checks do not establish the truth of group summaries, importance judgments or equivalence of business behavior. Review those meanings before delivery; a `ready` plan can coexist with partial analysis and unfinished evidence review.
 
 ## Evidence Category Review
 
@@ -64,7 +124,7 @@ Use the row's `deferred_evidence` list for unresolved categories:
 
 Deferrals require a known key and a nonempty, specific reason. Duplicate keys, already-covered categories and modified inventories fail validation. Old schema-1 registers may omit these two additive fields; validation still derives the checklist from the source and rejects silent omissions in reviewed rows. Preserve historical registers; correct decisions in a new output directory rather than filling arbitrary claims or blanket deferrals merely to get PASS.
 
-Validation returns `evidence_review_counts` (`covered`, `deferred`, `unreviewed`), counting application/category pairs across the task. Deferred categories remain outstanding evidence even if their application state is reviewed. Pending, deferred and metadata-only application states retain their existing meanings. Rendering displays these totals and each explicit category deferral.
+Validation returns `evidence_review_counts` (`covered`, `deferred`, `unreviewed`), counting application/category pairs across the task. Deferred categories remain outstanding evidence even if their application state is reviewed. Pending, deferred and metadata-only application states retain their existing meanings. Exact totals remain in the delivery summary; each explicit deferral needs a report or reasoned routine destination, with decision-relevant gaps beside the affected advice.
 
 `source_statistics` is computed from application-scope source records during validation and rendering. It preserves `input_kind` and capability-record totals by evidence level. Use it for capability numbers instead of assuming all capability records are E0 or adding artifact-scope copies. Existing `facts` and immutable context are unchanged.
 

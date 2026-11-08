@@ -51,7 +51,21 @@ def artifact_state(statuses):
 
 
 def application_facts(app, signals):
-    sdk_counts = Counter(item["name"] for item in app.get("sdks", ()))
+    sdk_counts = Counter()
+    sdk_kinds = Counter()
+    sdk_components = set()
+    sdk_vendors = set()
+    sdk_services = set()
+    for item in app.get("sdks", ()):
+        sdk_counts[item["name"]] += 1
+        kind = item.get("record_kind", "unknown")
+        sdk_kinds[kind] += 1
+        if kind == "component":
+            sdk_components.add(item["name"])
+        elif kind == "vendor_reference":
+            sdk_vendors.add(item.get("vendor", item["name"]))
+        elif kind == "service_reference":
+            sdk_services.add(item["name"])
     artifacts = {}
     dataflow = {}
     body_selection = []
@@ -86,6 +100,7 @@ def application_facts(app, signals):
         for name, value in signals.items()
         if name in SENSITIVE_SIGNALS and value["evidence_level"] >= "E2"
     )
+    classified_sdks = not sdk_kinds["unknown"]
     return {
         "version": FACTS_VERSION,
         "scope": "app",
@@ -97,6 +112,11 @@ def application_facts(app, signals):
             "unit": "match_record",
             "records": sum(sdk_counts.values()),
             "by_name": dict(sorted(sdk_counts.items())),
+            "by_record_kind": dict(sorted(sdk_kinds.items())),
+            "component_candidates": sorted(sdk_components) if classified_sdks else None,
+            "vendor_references": sorted(sdk_vendors) if classified_sdks else None,
+            "service_references": sorted(sdk_services) if classified_sdks else None,
+            "classification_unknown_records": sdk_kinds["unknown"],
         },
         "artifact_statuses": {
             key: artifact_state(value) for key, value in sorted(artifacts.items())
@@ -119,6 +139,9 @@ def report_facts(report, views, cancel=None, budget=None):
     applications = Counter()
     sdk_records = Counter()
     sdk_apps = Counter()
+    sdk_kinds = Counter()
+    sdk_components = Counter()
+    sdk_unknown = 0
     permissions = Counter()
     endpoints = 0
     artifacts = {}
@@ -146,6 +169,11 @@ def report_facts(report, views, cancel=None, budget=None):
         endpoints += view["summary"]["endpoint_count"]
         sdk_records.update(facts["sdks"]["by_name"])
         sdk_apps.update(facts["sdks"]["by_name"].keys())
+        sdk_kinds.update(facts["sdks"].get("by_record_kind", {}))
+        sdk_unknown += facts["sdks"].get(
+            "classification_unknown_records", facts["sdks"]["records"]
+        )
+        sdk_components.update(facts["sdks"].get("component_candidates") or ())
         for key in ("manifest_records", "snapshot_only_records"):
             permissions[key] += facts["permissions"][key]
         artifacts.update(facts["artifact_statuses"])
@@ -228,6 +256,12 @@ def report_facts(report, views, cancel=None, budget=None):
             "unit": "match_record",
             "records": sum(sdk_records.values()),
             "distinct_names": len(sdk_records),
+            "by_record_kind": dict(sorted(sdk_kinds.items())),
+            "distinct_components": len(sdk_components) if not sdk_unknown else None,
+            "component_application_groups": dict(sorted(sdk_components.items()))
+            if not sdk_unknown
+            else None,
+            "classification_unknown_records": sdk_unknown,
             "by_name": {
                 name: {
                     "records": sdk_records[name],

@@ -485,15 +485,29 @@ def dex_index(
             + prototypes[proto]
         )
     count, offset = table(96, 32)
+    defined_types = {}
+    structure_gaps = []
+    definition_inventory_complete = True if inspect_code else None
+    for class_index in checked_range(count, budget):
+        type_index = reader.u32(offset + class_index * 32)
+        if type_index >= len(types):
+            structure_gaps.append(
+                "DEX class definition type index is outside the type table"
+            )
+            definition_inventory_complete = False
+            continue
+        if type_index in defined_types:
+            structure_gaps.append("DEX contains duplicate class definitions")
+            definition_inventory_complete = False
+            continue
+        defined_types[type_index] = class_index
     references = {}
     calls = []
     gaps = []
     scanned_methods = 0
     reference_count = 0
     reference_scan_stopped = False
-    structure_gaps = []
     scan_stopped = False
-    definition_inventory_complete = True if inspect_code else None
 
     def discover_code(body, code_offset):
         nonlocal reference_count, reference_scan_stopped
@@ -566,7 +580,7 @@ def dex_index(
         return True
 
     if inspect_code:
-        for class_index in range(count):
+        for class_index in defined_types.values():
             budget.check()
             class_data = reader.u32(offset + class_index * 32 + 24)
             if not class_data:
@@ -643,6 +657,7 @@ def dex_index(
     result = {
         "strings": strings,
         "types": types,
+        "defined_types": defined_types,
         "methods": methods,
         "references": references,
         "calls": calls,
@@ -652,7 +667,9 @@ def dex_index(
         "bodies": [],
         "structure_gaps": sorted(set(structure_gaps)),
         "definition_inventory_complete": definition_inventory_complete,
-        "reference_scan_complete": not gaps if inspect_code else None,
+        "reference_scan_complete": not gaps and not structure_gaps
+        if inspect_code
+        else None,
     }
     if not deferred and inspect_code and not scan_stopped:
         selected, metrics = selection.select()

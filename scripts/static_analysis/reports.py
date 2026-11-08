@@ -15,7 +15,7 @@ from .common import (
     check_resources,
     read_json,
 )
-from .endpoints import sanitized
+from .endpoints import sanitized, telemetry_candidate
 from .facts import application_facts, report_facts, system_classification
 from .metrics import phase
 from .storage import (
@@ -396,7 +396,11 @@ def markdown(report, limit=100, cancel=None, budget=None, *, facts=None):
                 len(app["artifacts"]),
                 len(app["permissions"]),
                 len(app["endpoints"]),
-                ", ".join(view["summary"]["sdk_candidates"]),
+                ", ".join(view["summary"].get("sdk_components") or ())
+                if view["summary"].get("sdk_components") is not None
+                else "Unknown (legacy classification)",
+                ", ".join(view["summary"].get("sdk_vendor_references") or ()),
+                ", ".join(view["summary"].get("sdk_service_references") or ()),
             ),
         )
         if len(tables["recommendations"]) < limit:
@@ -477,8 +481,11 @@ def markdown(report, limit=100, cancel=None, budget=None, *, facts=None):
                 (
                     package,
                     sdk["name"],
+                    sdk.get("record_kind", "unknown (legacy)"),
+                    sdk.get("vendor", "unknown"),
                     sdk["purpose"],
                     sdk["match_basis"],
+                    ", ".join(sdk.get("roles", ())),
                     ", ".join(evidence["id"] for evidence in sdk["evidence"][:3]),
                 ),
             )
@@ -636,10 +643,7 @@ def export_reports(
             check_resources(cancel, budget)
             if item.get("host"):
                 hosts.add(item["host"])
-                if set(item["tags"]) & {
-                    "telemetry_path_candidate",
-                    "sdk_telemetry_domain_candidate",
-                }:
+                if telemetry_candidate(item):
                     telemetry.add(item["host"])
     write_domains("domains.txt", sorted(hosts))
     write_domains("telemetry-domains.txt", sorted(telemetry))

@@ -33,8 +33,8 @@ System classification is unknown when package metadata is incomplete or flags ar
 
 ## Application Overview
 
-| Application | Status | Artifacts | Permissions | Endpoint Candidates | SDK Candidates |
-|---|---|---|---|---|---|
+| Application | Status | Artifacts | Permissions | Endpoint Candidates | Component Candidates | Unclassified Vendor References | Address References |
+|---|---|---|---|---|---|---|---|
 {{apps}}
 
 ## Permission Declarations and Snapshots
@@ -47,14 +47,18 @@ System classification is unknown when package metadata is incomplete or flags ar
 
 ## Data Access Capabilities
 
+E0 evidence identifies Manifest declarations and their declaring artifacts, with captured grant state/source kept separate. Snapshot-only records do not establish declarations or expand the declaring artifact set. A denied permission can still be declared; declared access does not prove effective authorization or use.
+
 | Application | Capability | Evidence Level | Meaning |
 |---|---|---|---|
 {{capabilities}}
 
-## SDK Candidates
+## Component, Vendor and Address References
 
-| Application | SDK | Purpose | Match Basis | Evidence ID Sample |
-|---|---|---|---|---|
+Component candidates include ordinary foundation libraries. Vendor references do not identify a specific component or purpose. Address references do not establish code integration. These groups overlap in attribution and must not be added as independent SDKs. Definitions, type references and endpoint roles remain visible in source evidence; legacy classifications remain unknown.
+
+| Application | Name | Record Kind | Vendor | Purpose | Match Basis | Address Roles | Evidence ID Sample |
+|---|---|---|---|---|---|---|---|
 {{sdks}}
 
 ## Privacy Paths, Capabilities and Endpoint Findings

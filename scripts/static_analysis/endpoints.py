@@ -7,6 +7,7 @@ from collections import Counter
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .common import stable_id
+from .evidence import retain_evidence
 
 URL_PATTERN = re.compile(r"(?i)\b(?:https?|wss?|mqtts?|tcp|tls|udp)://[^\s<>\"'`\\]+")
 RELATIVE_PATTERN = re.compile(
@@ -55,6 +56,74 @@ ESCAPE_PATTERN = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|(/))")
 BASE64_PATTERN = re.compile(r"[A-Za-z0-9+/_-]{16,8192}={0,2}\Z")
 MATCH_BUDGET_INTERVAL = 256
 NETWORK_SCHEMES = {"http", "https", "ws", "wss", "mqtt", "mqtts", "tcp", "tls", "udp"}
+NON_SERVICE_ROLES = frozenset(
+    {"documentation", "privacy_policy", "policy_list", "schema"}
+)
+DOCUMENTATION_PATHS = {
+    "manual.sensorsdata.cn": ("/sa/",),
+    "developer.umeng.com": ("/docs/",),
+    "docs.sentry.io": ("/",),
+    "developer.android.com": (
+        "/reference/",
+        "/guide/",
+        "/training/",
+        "/topic/",
+        "/topics/",
+    ),
+    "facebook.github.io": ("/react-native/", "/fresco/"),
+    "frescolib.org": ("/docs/",),
+}
+PRIVACY_DOCUMENT_PATH = re.compile(
+    r"(?i)^/(?:privacy(?:[-_]?policy)?(?:/explanation)?|legal/privacy)(?:\.html?|\.pdf)?/?$"
+)
+SCHEMA_PATHS = {
+    "schemas.android.com": ("/apk/res/", "/tools"),
+    "www.w3.org": ("/1999/", "/2000/", "/2001/", "/2005/", "/XML/", "/ns/"),
+}
+
+
+def endpoint_role(endpoint, source):
+    entry = source.get("entry", "").replace("\\", "/")
+    if entry.startswith("assets/privacy_sandbox_attestations/"):
+        return "policy_list"
+    host = endpoint.get("host")
+    try:
+        path = urlsplit(endpoint.get("value", "")).path
+    except ValueError:
+        return "unknown"
+    if path.startswith(DOCUMENTATION_PATHS.get(host, ())):
+        return "documentation"
+    if path.startswith(SCHEMA_PATHS.get(host, ())):
+        return "schema"
+    if PRIVACY_DOCUMENT_PATH.fullmatch(path):
+        return "privacy_policy"
+    return "unknown"
+
+
+def assign_endpoint_roles(endpoint):
+    if "roles" not in endpoint:
+        endpoint["roles"] = sorted(
+            {endpoint_role(endpoint, item) for item in endpoint.get("evidence", ())}
+            or {endpoint_role(endpoint, {})}
+        )
+    if not service_reference(endpoint):
+        endpoint["tags"] = sorted(
+            set(endpoint.get("tags", ()))
+            - {"telemetry_path_candidate", "sdk_telemetry_domain_candidate"}
+        )
+
+
+def service_reference(endpoint):
+    return not endpoint.get("roles") or any(
+        role not in NON_SERVICE_ROLES for role in endpoint["roles"]
+    )
+
+
+def telemetry_candidate(endpoint):
+    return service_reference(endpoint) and bool(
+        set(endpoint.get("tags", ()))
+        & {"telemetry_path_candidate", "sdk_telemetry_domain_candidate"}
+    )
 
 
 def host_normalize(value):
@@ -347,13 +416,12 @@ class EndpointCollector:
                     if record is None:
                         continue
                     evidence = self._evidence(source, match, transforms)
-                    if len(record["evidence"]) < self.limits.max_evidence:
-                        if evidence["id"] not in {
-                            item["id"] for item in record["evidence"]
-                        }:
-                            record["evidence"].append(evidence)
-                    else:
-                        self.evidence_truncated = True
+                    role = endpoint_role(endpoint, source)
+                    evidence["role"] = role
+                    record["roles"] = sorted(set(record.get("roles", ())) | {role})
+                    self.evidence_truncated |= retain_evidence(
+                        record["evidence"], [evidence], self.limits.max_evidence
+                    )
                     if references:
                         record["evidence_level"] = "E2"
                         for reference in references:
@@ -365,13 +433,9 @@ class EndpointCollector:
                             linked["id"] = stable_id(
                                 "reference", evidence["id"], reference
                             )
-                            if len(record["evidence"]) < self.limits.max_evidence:
-                                if linked["id"] not in {
-                                    item["id"] for item in record["evidence"]
-                                }:
-                                    record["evidence"].append(linked)
-                            else:
-                                self.evidence_truncated = True
+                            self.evidence_truncated |= retain_evidence(
+                                record["evidence"], [linked], self.limits.max_evidence
+                            )
                 occupied.extend(spans)
 
     @property
@@ -413,6 +477,8 @@ class EndpointCollector:
         return "; ".join(reasons) or None
 
     def results(self):
+        for item in self.items.values():
+            assign_endpoint_roles(item)
         return sorted(
             self.items.values(), key=lambda item: (item["kind"], item["value"])
         )

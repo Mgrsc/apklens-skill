@@ -24,6 +24,7 @@ engine = importlib.import_module("scripts.static_analysis.engine")
 reports = importlib.import_module("scripts.static_analysis.reports")
 storage = importlib.import_module("scripts.static_analysis.storage")
 endpoints = importlib.import_module("scripts.static_analysis.endpoints")
+rules = importlib.import_module("scripts.static_analysis.rules")
 support = importlib.import_module("support")
 SIGNAL_TYPES = (
     "device_identifier",
@@ -289,6 +290,70 @@ def run(args):
     }
 
 
+def run_sdk(args):
+    candidates = list(
+        dict.fromkeys(
+            "L" + prefix + ("Fixture;" if prefix.endswith("/") else "")
+            for _, _, prefixes, _ in rules.SDK_RULES
+            for prefix in prefixes
+        )
+    )
+    cases = {}
+    for profile in ("unmatched", "references_first", "definitions_last", "mixed"):
+        types = [f"Lfixture/types/Type{index};" for index in range(args.sdk_types)]
+        definitions = {}
+        if profile == "references_first":
+            types[: len(candidates)] = candidates
+        elif profile == "definitions_last":
+            start = len(types) - len(candidates)
+            types[start:] = candidates
+            definitions = {start + index: index for index in range(len(candidates))}
+        elif profile == "mixed":
+            middle = len(candidates) // 2
+            types[:middle] = candidates[:middle]
+            start = len(types) - len(candidates) + middle
+            types[start:] = candidates[middle:]
+            definitions = {
+                index: order for order, index in enumerate(range(0, len(types), 4))
+            }
+        samples = []
+        digest = None
+        record_count = 0
+        for repeat in range(args.repeats + 1):
+            started = time.perf_counter()
+            records = rules.sdk_matches(
+                types, [], "fixture", "classes.dex", defined_types=definitions
+            )
+            elapsed = time.perf_counter() - started
+            checksum = hashlib.sha256(
+                json.dumps(records, sort_keys=True).encode()
+            ).hexdigest()
+            if digest is not None and digest != checksum:
+                raise AssertionError("SDK benchmark output changed across repeats")
+            digest = checksum
+            record_count = len(records)
+            if repeat:
+                samples.append(elapsed)
+        cases[profile] = {
+            "types": len(types),
+            "definitions": len(definitions),
+            "records": record_count,
+            "result_sha256": digest,
+            "median_seconds": statistics.median(samples),
+            "samples": samples,
+        }
+    return {
+        "configuration": {
+            "source_root": str(SOURCE_ROOT),
+            "rule_count": len(rules.SDK_RULES),
+            "sdk_types": args.sdk_types,
+            "repeats": args.repeats,
+            "python": sys.version,
+        },
+        "sdk_matching": cases,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apps", type=int, default=10)
@@ -296,10 +361,15 @@ def main():
     parser.add_argument("--splits", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--sdk-only", action="store_true")
+    parser.add_argument("--sdk-types", type=int, default=200000)
     args = parser.parse_args()
-    if min(args.apps, args.records, args.splits, args.repeats) < 1:
+    if min(args.apps, args.records, args.splits, args.repeats, args.sdk_types) < 1:
         parser.error("Counts must be positive")
-    result = run(args)
+    minimum_types = sum(len(prefixes) for _, _, prefixes, _ in rules.SDK_RULES)
+    if args.sdk_only and args.sdk_types < minimum_types:
+        parser.error("SDK type count must cover the rule fixture")
+    result = run_sdk(args) if args.sdk_only else run(args)
     payload = json.dumps(result, ensure_ascii=True, indent=2)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

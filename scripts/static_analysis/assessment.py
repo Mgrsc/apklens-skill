@@ -4,6 +4,7 @@ from collections import Counter
 
 from .common import AnalysisError
 from .endpoints import sanitized
+from .evidence import DECLARATION_EVIDENCE_KINDS, evidence_level
 from .reports import _application_view, app_summary, summary
 from .storage import EVIDENCE_SECTIONS, INDEXED_STORE_VERSION, Records
 
@@ -59,6 +60,48 @@ def finding_key(finding):
     return kind + ":" + category if category else kind
 
 
+def declaration_evidence_supported(app, evidence):
+    if (
+        evidence.get("kind") not in DECLARATION_EVIDENCE_KINDS
+        or evidence.get("declaration") == "snapshot_only"
+    ):
+        return False
+    permissions = [
+        item
+        for item in app.get("permissions", ())
+        if item["name"] == evidence.get("excerpt")
+        and item.get("declaration") != "snapshot_only"
+        and (
+            evidence.get("declaration") is None
+            or item.get("declaration") == evidence["declaration"]
+        )
+    ]
+    artifacts = {
+        artifact for item in permissions for artifact in item.get("artifacts", ())
+    }
+    cited = set(evidence.get("artifacts", ()))
+    if evidence.get("artifact"):
+        cited.add(evidence["artifact"])
+    return bool(permissions) and cited.issubset(artifacts)
+
+
+def finding_reference_level(app, finding):
+    level = finding.get("evidence_level", "E0")
+    if level in {"E3", "E4"}:
+        return level
+    locations = list(finding.get("evidence", ()))
+    for identity in finding.get("evidence_ids", ()):
+        context = evidence_context(app, identity)
+        if context:
+            locations.append(context[1])
+    if level == "E0" and any(
+        not declaration_evidence_supported(app, item) for item in locations
+    ):
+        return None
+    support = [evidence_level(item) for item in locations]
+    return min(level, max(support)) if support else None
+
+
 def evidence_inventory(app, claims=None):
     finding_ids = set()
     evidence_levels = {}
@@ -67,7 +110,7 @@ def evidence_inventory(app, claims=None):
         for identity in claim.get("evidence_ids", ()):
             context = evidence_context(app, identity)
             if context:
-                level = context[0].get("evidence_level", "E0")
+                level = evidence_level(context[1])
                 evidence_levels[identity] = max(
                     evidence_levels.get(identity, "E0"), level
                 )
@@ -75,10 +118,12 @@ def evidence_inventory(app, claims=None):
         finding = record_by_id(app, "findings", identity)
         if finding:
             for evidence_id in finding.get("evidence_ids", ()):
-                evidence_levels[evidence_id] = max(
-                    evidence_levels.get(evidence_id, "E0"),
-                    finding.get("evidence_level", "E0"),
-                )
+                context = evidence_context(app, evidence_id)
+                if context:
+                    evidence_levels[evidence_id] = max(
+                        evidence_levels.get(evidence_id, "E0"),
+                        evidence_level(context[1]),
+                    )
     groups = {}
     for section in ("findings", "endpoints"):
         records = app.get(section, ()) if section == "findings" or groups else ()
@@ -114,6 +159,7 @@ def evidence_inventory(app, claims=None):
             if level == item["highest_evidence_level"] and (
                 section == "findings"
                 and record["id"] in finding_ids
+                and (finding_reference_level(app, record) or "") >= level
                 or any(
                     evidence_levels.get(identity, "") >= level
                     for identity in references
@@ -279,7 +325,7 @@ def validate_claim(app, claim):
         if finding is None:
             errors.append("Finding is missing or belongs to another application group")
             continue
-        levels.append(finding.get("evidence_level"))
+        levels.append(finding_reference_level(app, finding))
         cited_evidence.update(finding.get("evidence_ids", ()))
         if kind == "static_path" and finding.get("type") != "privacy_transmission_path":
             errors.append("A static path requires a modeled dataflow finding")
@@ -288,8 +334,13 @@ def validate_claim(app, claim):
         if context is None:
             errors.append("Evidence is missing or belongs to another application group")
             continue
-        parent, evidence = context
-        levels.append(parent.get("evidence_level"))
+        _, evidence = context
+        if kind == "declaration" and not declaration_evidence_supported(app, evidence):
+            errors.append(
+                "A declaration claim requires matching Manifest permission facts and artifact scope"
+            )
+        if kind != "static_path":
+            levels.append(evidence_level(evidence))
         if kind == "direct_call" and evidence.get("kind") not in {
             "dex_invocation",
             "dex_string_reference",
@@ -417,6 +468,9 @@ def validate_assessment(report, assessment):
     errors = []
     counts = Counter({state: 0 for state in sorted(REVIEW_STATES)})
     evidence_counts = Counter({"covered": 0, "deferred": 0, "unreviewed": 0})
+    claim_count = 0
+    claim_groups = 0
+    recommendation_count = 0
     if not isinstance(assessment, dict):
         errors.append("Assessment must be a JSON object")
         assessment = {}
@@ -505,15 +559,20 @@ def validate_assessment(report, assessment):
                 errors.append(prefix + "invalid claim")
                 continue
             identity = claim.get("id")
+            duplicate = False
             if isinstance(identity, str):
                 if identity in claim_ids:
                     errors.append(prefix + "duplicate claim ID")
+                    duplicate = True
                 claim_ids.add(identity)
             claim_errors = validate_claim(app, claim)
             errors.extend(prefix + error for error in claim_errors)
-            if not claim_errors:
+            if not claim_errors and not duplicate:
                 valid_claims.append(claim)
+        valid_claim_ids = {claim["id"] for claim in valid_claims}
         reviewed_inventory = evidence_inventory(app, valid_claims)
+        claim_count += len(valid_claims)
+        claim_groups += bool(valid_claims)
         inventory = [
             {key: value for key, value in item.items() if key != "covered"}
             for item in reviewed_inventory
@@ -570,17 +629,22 @@ def validate_assessment(report, assessment):
             if not isinstance(recommendation, dict):
                 errors.append(prefix + "invalid recommendation")
                 continue
-            errors.extend(
-                prefix + error
-                for error in validate_recommendation(app, recommendation, claim_ids)
+            recommendation_errors = validate_recommendation(
+                app, recommendation, valid_claim_ids
             )
             if (
                 state in ("pending", "deferred")
                 and recommendation.get("action") != "defer"
             ):
-                errors.append(
-                    prefix + "outstanding review permits only a deferred action"
+                recommendation_errors.append(
+                    "outstanding review permits only a deferred action"
                 )
+            errors.extend(prefix + error for error in recommendation_errors)
+            recommendation_count += (
+                not recommendation_errors
+                and isinstance(state, str)
+                and state in REVIEW_STATES
+            )
     if indexed:
         errors.append("Assessment contains application groups outside this task")
     return {
@@ -591,6 +655,22 @@ def validate_assessment(report, assessment):
         "outstanding_review": counts["pending"] + counts["deferred"],
         "unavailable_code": sum(not app.get("artifacts") for app in report["apps"]),
         "analysis_status": report["run"]["status"],
+        "delivery_summary": {
+            "analysis_status": report["run"]["status"],
+            "stop_reason": report["run"].get("stop_reason"),
+            "validation_status": "FAILED" if errors else "PASS",
+            "review_counts": dict(counts),
+            "evidence_review_counts": dict(evidence_counts),
+            "claim_count": claim_count,
+            "application_groups_with_claims": claim_groups,
+            "recommendation_count": recommendation_count,
+            "review_complete": bool(counts["reviewed"])
+            and not errors
+            and counts["reviewed"] == sum(counts.values())
+            and not evidence_counts["unreviewed"]
+            and not evidence_counts["deferred"],
+            "meaning": "Ledger coverage only; parsing, validation and rendering do not establish exhaustive code review or actual execution",
+        },
         "errors": errors,
         "meaning": "Structural and source validation only; PASS does not mean complete review, safe remediation or observed runtime behavior",
     }

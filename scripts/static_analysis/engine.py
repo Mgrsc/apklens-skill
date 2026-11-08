@@ -40,7 +40,13 @@ from .common import (
     stage,
 )
 from .dataflow import MODEL_VERSION, analyze_dataflow, evidence_path_key
-from .endpoints import EndpointCollector, host_matches
+from .endpoints import (
+    EndpointCollector,
+    assign_endpoint_roles,
+    host_matches,
+    service_reference,
+)
+from .evidence import merge_evidence, retain_evidence
 from .manifest import analyze_manifest
 from .method_selection import MethodSelection
 from .metrics import phase
@@ -390,7 +396,9 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                         result["statistics"]["scanned_methods"] += index[
                             "scanned_methods"
                         ]
-                        descriptors.append((name, index["types"]))
+                        descriptors.append(
+                            (name, index["types"], index["defined_types"])
+                        )
                         fields_truncated = False
                         for field_index, field in enumerate(index["fields"]):
                             if field_index % 256 == 0:
@@ -422,16 +430,20 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                             )
                         structure_stages[name] = stage(
                             "dex_structure_index",
-                            "DEFERRED"
+                            "PARTIAL"
+                            if index["structure_gaps"]
+                            else "DEFERRED"
                             if mode == "quick"
                             else "PARTIAL"
                             if index["structure_gaps"] or index["gaps"]
                             else "COMPLETE",
                             name,
-                            "Quick mode excludes method bodies"
-                            if mode == "quick"
-                            else "; ".join(index["structure_gaps"] + index["gaps"])
-                            or None,
+                            "; ".join(index["structure_gaps"] + index["gaps"])
+                            or (
+                                "Quick mode excludes method bodies"
+                                if mode == "quick"
+                                else None
+                            ),
                             methods=None if mode == "quick" else 0,
                             method_definitions=selection.considered
                             - previous_definitions
@@ -735,7 +747,7 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
     if not cancel.is_set():
         try:
             domain_matches = sdk_domain_matches(result["endpoints"], budget)
-            for name, types in descriptors or [("archive", [])]:
+            for name, types, defined_types in descriptors:
                 result["sdks"].extend(
                     sdk_matches(
                         types,
@@ -744,8 +756,23 @@ def analyze_artifact(artifact, limits, mode, cancel, cache_directory=None):
                         name,
                         domain_matches,
                         budget,
+                        defined_types=defined_types,
+                        include_domains=False,
+                        max_evidence=limits.max_evidence,
                     )
                 )
+            result["sdks"].extend(
+                sdk_matches(
+                    [],
+                    result["endpoints"],
+                    identity,
+                    "archive",
+                    domain_matches,
+                    budget,
+                    include_domains=True,
+                    max_evidence=limits.max_evidence,
+                )
+            )
             budget.check()
         except MemoryBudgetExceeded as error:
             result["resource_limited"] = True
@@ -1172,17 +1199,7 @@ def merge_records(records, limits):
             merged[key] = copy.deepcopy(item)
             continue
         target = merged[key]
-        if item.get("evidence_level", "E0") > target.get("evidence_level", "E0"):
-            target["evidence_level"] = item["evidence_level"]
-        existing = {evidence["id"] for evidence in target.get("evidence", [])}
-        for evidence in item.get("evidence", []):
-            if evidence["id"] in existing:
-                continue
-            if len(target["evidence"]) >= limits.max_evidence:
-                truncated = True
-                break
-            target["evidence"].append(evidence)
-            existing.add(evidence["id"])
+        truncated |= merge_evidence(target, item, limits.max_evidence)
     return list(merged.values()), truncated
 
 
@@ -1487,6 +1504,8 @@ def build_findings(app, store=None):
 
     def endpoint_findings():
         for endpoint in app["endpoints"]:
+            previous_roles, previous_tags = endpoint.get("roles"), endpoint.get("tags")
+            assign_endpoint_roles(endpoint)
             if "telemetry_path_candidate" in endpoint["tags"]:
                 yield {
                     "id": stable_id("finding", app["id"], endpoint["id"]),
@@ -1496,14 +1515,12 @@ def build_findings(app, store=None):
                     "evidence_ids": [item["id"] for item in endpoint["evidence"]],
                     "meaning": "Path naming suggests telemetry; data collection and transmission are unproven",
                 }
-            if endpoint.get("host"):
+            if endpoint.get("host") and service_reference(endpoint):
                 matches = list(sdk_candidates(endpoint["host"]))
                 if matches:
                     endpoint["tags"] = sorted(
                         set(endpoint["tags"]) | {"sdk_telemetry_domain_candidate"}
                     )
-                    if store:
-                        store.update_record(app["id"], "endpoints", endpoint)
                     yield {
                         "id": stable_id("sdk_endpoint", app["id"], endpoint["id"]),
                         "type": "sdk_endpoint_candidate",
@@ -1513,6 +1530,11 @@ def build_findings(app, store=None):
                         "evidence_ids": [item["id"] for item in endpoint["evidence"]],
                         "meaning": "Host matches a maintained SDK rule; ownership and actual network use are unverified",
                     }
+            if store and (
+                previous_roles != endpoint.get("roles")
+                or previous_tags != endpoint.get("tags")
+            ):
+                store.update_record(app["id"], "endpoints", endpoint)
 
     findings.extend(endpoint_findings())
     important = {}
@@ -1547,20 +1569,21 @@ def build_findings(app, store=None):
         if name and name not in important:
             evidence = [
                 {
-                    "id": stable_id("declared_privacy", app["id"], permission),
-                    "kind": "manifest_or_snapshot_permission",
-                    "excerpt": permission,
-                    "artifacts": sorted(
-                        {
-                            artifact
-                            for item in app["permissions"]
-                            if item["name"] == permission
-                            for artifact in item.get("artifacts", ())
-                        }
-                    ),
+                    "id": stable_id("declared_privacy", app["id"], item),
+                    "kind": "manifest_permission",
+                    "excerpt": item["name"],
+                    "declaration": item.get("declaration"),
+                    "max_sdk": item.get("max_sdk"),
+                    "grant_source": item.get("grant_source"),
+                    "granted": item.get("granted"),
+                    "artifacts": sorted(set(item.get("artifacts", ()))),
                 }
-                for permission in capability.get("permissions", ())
+                for item in app["permissions"]
+                if item["name"] in capability.get("permissions", ())
+                and item.get("declaration") != "snapshot_only"
             ]
+            if not evidence:
+                continue
             important[name] = {"evidence_level": "E0"}
             findings.append(
                 {
@@ -1571,27 +1594,24 @@ def build_findings(app, store=None):
                     "evidence_level": "E0",
                     "evidence": evidence,
                     "evidence_ids": [item["id"] for item in evidence],
-                    "meaning": "Declared or captured permission capability requires review; API use and data transmission are unproven",
+                    "meaning": "Manifest-declared permission capability requires review; authorization, API use and data transmission are unproven",
                 }
             )
     events = []
     event_level = "E0"
+    events_truncated = False
     for item in app["signals"]:
         if item["type"] in {"telemetry_event", "diagnostic_field"}:
             event_level = max(event_level, item["evidence_level"])
-            if len(events) < 20:
-                events.append(item)
+            events_truncated |= retain_evidence(events, item["evidence"], 20)
     if events:
         findings.append(
             {
                 "id": stable_id("telemetry_implementation", app["id"]),
                 "type": "telemetry_implementation_candidate",
                 "evidence_level": event_level,
-                "evidence_ids": [
-                    evidence["id"]
-                    for item in events[:20]
-                    for evidence in item["evidence"]
-                ],
+                "evidence_truncated": events_truncated,
+                "evidence_ids": [evidence["id"] for evidence in events],
                 "meaning": "Event APIs or diagnostic fields exist; endpoint association and actual execution are unproven",
             }
         )

@@ -18,6 +18,8 @@ from .common import (
     MemoryBudgetExceeded,
     check_resources,
 )
+from .endpoints import telemetry_candidate
+from .evidence import merge_evidence
 from .facts import application_facts, artifact_state
 from .metrics import phase
 
@@ -64,6 +66,7 @@ def application_view(app, signal_stats=None, sdk_names=None):
             )
     if sdk_names is None:
         sdk_names = {item["name"] for item in app["sdks"]}
+    facts = application_facts(app, signal_stats)
     coverage_counts = Counter(item["status"] for item in app["coverage"])
     return {
         "summary": {
@@ -76,6 +79,9 @@ def application_view(app, signal_stats=None, sdk_names=None):
             "permission_count": len(app["permissions"]),
             "endpoint_count": len(app["endpoints"]),
             "sdk_candidates": sorted(sdk_names),
+            "sdk_components": facts["sdks"].get("component_candidates"),
+            "sdk_vendor_references": facts["sdks"].get("vendor_references"),
+            "sdk_service_references": facts["sdks"].get("service_references"),
             "signal_types": sorted(signal_stats),
             "finding_count": len(app["findings"]),
             "priority": app["priority"],
@@ -87,7 +93,7 @@ def application_view(app, signal_stats=None, sdk_names=None):
             for status, count in coverage_counts.items()
             if status not in COMPLETE_COVERAGE_STATUSES
         ),
-        "facts": application_facts(app, signal_stats),
+        "facts": facts,
     }
 
 
@@ -746,18 +752,7 @@ class AnalysisStore:
                 ordinal += 1
                 continue
             target = json.loads(row[0])
-            target["evidence_level"] = max(
-                target.get("evidence_level", "E0"), value.get("evidence_level", "E0")
-            )
-            existing = {item["id"] for item in target.get("evidence", [])}
-            for evidence in value.get("evidence", []):
-                if evidence["id"] in existing:
-                    continue
-                if len(target["evidence"]) >= limits.max_evidence:
-                    truncated = True
-                    break
-                target["evidence"].append(evidence)
-                existing.add(evidence["id"])
+            truncated |= merge_evidence(target, value, limits.max_evidence)
             self.update_record(app_id, section, target)
         return truncated
 
@@ -858,10 +853,7 @@ class AnalysisStore:
                 elif section == "sdks":
                     sdk_names.add(record["name"])
                 elif record.get("host"):
-                    telemetry = bool(
-                        set(record["tags"])
-                        & {"telemetry_path_candidate", "sdk_telemetry_domain_candidate"}
-                    )
+                    telemetry = telemetry_candidate(record)
                     host = record["host"]
                     domains[host] = max(domains.get(host, 0), int(telemetry))
                     if len(domains) >= EVIDENCE_INSERT_BATCH:

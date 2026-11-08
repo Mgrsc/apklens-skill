@@ -14,7 +14,11 @@ E2 for a URL indicates only that an instruction references the string. E2 for an
 
 E3/E4 findings contain ordered source, transformation and sink evidence, modeled branch conditions, and resolved-candidate or unresolved endpoint status. They establish possible paths within the declared model, not observed execution. All indexed definitions are candidate roots; a path can belong to unreachable or disabled code. Legal, authorized transmission remains a dataflow positive and is not automatically a privacy violation. Sensitive capabilities also produce separate review candidates without requiring telemetry keywords or known vendor domains. See [privacy models and limits](privacy-analysis.md).
 
-SDK detection records namespaces, domains, or composite rules. Domain matching respects full host and subdomain boundaries rather than arbitrary substrings; for example, `sentry.io` does not match `sentry.io.evil.example`. The presence of an SDK does not prove it is enabled, and broad vendor namespaces do not equate to telemetry.
+SDK records distinguish `component`, `vendor_reference` and `service_reference` using `record_kind`. Foundation components such as Fresco, React Native, fastjson, MMKV and ShadowHook are distinct from analytics, advertising, login and push components. Unclassified vendor namespaces retain neutral `sdk` purpose. Parent-vendor attribution and child components are not separate integrations. Class definitions (`dex_class_definition`) and type-table references (`dex_type_reference`) are both E1 and preserve their respective indexes; neither establishes runtime enablement. Domain-only records are address references, generated once per artifact rather than once per DEX, and do not establish code integration. Domain matching respects full host and subdomain boundaries; `sentry.io` does not match `sentry.io.evil.example`.
+
+Endpoint `roles` distinguish known documentation, privacy-policy pages, schemas, policy lists and unknown references. Known non-service references remain in the endpoint inventory and `domains.txt`, but are excluded from telemetry candidates unless the same address also has an unknown/service reference. Classification uses specific host/path and source context, not a general blacklist of names containing `docs`. Unknown roles are not verified receivers. Candidate domain exports remain unsuitable as automatic blocklists.
+
+Bounded evidence selection retains a highest-level witness when later evidence upgrades a record; `evidence_truncated` or coverage reports disclose omitted locations. A finding's E2 grade must be supported by an actual instruction location. A weak string within an E2 parent remains E1 and cannot satisfy an E2 category review. Generic business/UI event methods remain `event_dispatch` clues; only maintained SDK owners establish telemetry-event candidates. Speech and sensor signals distinguish operation roles and do not treat arbitrary parameter types or cleanup calls as acquisition.
 
 ## From Evidence to User Actions
 
@@ -26,6 +30,7 @@ User-facing assessments include practical, application-specific recommendations 
 - Local: Explicitly supplied APK files; grouped by package name and version without inferring omitted splits.
 - Manifest: Binary XML or text XML (used in testing/exports); preserves type information including namespaces, booleans, integers, and resource references.
 - DEX: Standard little-endian DEX 035, 037, 038, 039, 040; parses strings, types, methods, and supported instructions. Unsupported formats fall back to raw printable strings with partial coverage noted.
+- Duplicate or out-of-range class-definition indexes record structure gaps and incomplete definition/reference coverage. The first valid definition is retained; invalid entries are skipped without discarding independently parsed type/method/field tables or valid-class calls. Quick mode also discloses these structure gaps. Unrecoverable header/table errors retain the existing raw-string fallback.
 - Resources: String pools from `resources.arsc`, XML attributes and text nodes, assets, raw resources, and selected text files.
 - Native: Printable ASCII and simple UTF-16LE strings in `.so` files; native control flow is not parsed.
 - Source: Optional Java/Kotlin decompiled text from jadx; matches indicate clues, not confirmed execution.
@@ -44,6 +49,10 @@ Arbitrary JavaScript expressions, complex runtime string builders, custom cipher
 
 Declared permissions preserve maximum SDK, declaration types, and artifact sources. Snapshot facts preserve grant sources and user scopes. Shared UID permissions are merged into member applications; runtime permissions reflect the selected user only. AppOps values are preserved as raw states; `default` is not converted to granted.
 
+Only Manifest permissions produce E0 declared capabilities. Snapshot-only grants and denials remain in permission/context facts and do not become Manifest declarations. A Manifest declaration remains E0 even when the captured grant is denied. AppOps allow does not establish active use, necessity, or effective access.
+
+E0 finding evidence preserves each declaration's type, maximum SDK, grant source/state and declaring artifact set. Same-name snapshot-only records cannot expand that set. Declaration claims, including legacy combined permission evidence, require matching non-snapshot permission facts and artifact scope; unsupported or mixed-scope evidence cannot cover an E0 category.
+
 Special access currently captures accessibility services, notification listeners, and default IME lists, and aggregates readable AppOps. Vendor-specific authorization mechanisms are not fully modeled; device errors, unparseable outputs, and empty returns must be interpreted using stage statuses.
 
 Components preserve explicit exported status, target SDK default derivations, application-level permission inheritance, and content provider read/write and path permissions. Network security and backup attributes reflect declared flags; unresolved resource references remain marked as unknown.
@@ -51,6 +60,8 @@ Components preserve explicit exported status, target SDK default derivations, ap
 ## Stage Statuses
 
 The summary's `facts` is the authoritative counting projection shared with application queries and Markdown. Endpoint counts are app-scope candidate records; SDK counts distinguish match records, distinct names and affected application groups. Artifact-scope provenance is not another population to add. Permission counts distinguish Manifest declarations and snapshot-only records. Inventory targets, application groups with/without APKs and unique artifact status counts use separate denominators. Captured system flags establish neither factory installation nor user intent. Older results without selection metrics retain an explicit unknown reason.
+
+SDK facts additionally expose `by_record_kind`, app-level `component_candidates` / `vendor_references` / `service_references`, and report-level `distinct_components` / `component_application_groups`. Component names deduplicate DEX/split references within an application group. Records lacking this classification contribute to `classification_unknown_records`; affected component totals remain null rather than retroactively interpreting legacy vendor names as components.
 
 Summary Top 20 and Markdown row limits are display limits. Each Markdown table reports total/shown/not_shown; query pages expose `has_more` and `next_offset`. Prepare a full [assessment register](assessment.md) to account for every group, then track reviewed, pending, deferred and metadata-only states independently of parser completion. Validation PASS does not mean all evidence has been reviewed.
 

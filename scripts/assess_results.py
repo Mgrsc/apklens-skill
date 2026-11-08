@@ -60,6 +60,12 @@ def main():
             args.output.mkdir(parents=True, exist_ok=False)
             atomic_json(args.output / "assessment.json", sanitized(assessment))
             result["files"] = {"assessment.json": str(args.output / "assessment.json")}
+            atomic_json(
+                args.output / "delivery-summary.json", result["delivery_summary"]
+            )
+            result["files"]["delivery-summary.json"] = str(
+                args.output / "delivery-summary.json"
+            )
             if rendered is not None:
                 atomic_text(args.output / "user-advice.md", rendered)
                 result["files"]["user-advice.md"] = str(args.output / "user-advice.md")

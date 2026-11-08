@@ -586,12 +586,23 @@ class PerformanceTests(unittest.TestCase):
         )
         self.assertEqual(len(outputs[1]["records"]), 2)
         self.assertEqual(
-            digest, "fe7f46426d067d475139efac1c87399f03834a78c876171648d0d3cb76166913"
+            digest, "c88daaa19b42497e4985ff8fafe2e8983a1f72d2e99e3f22df23daf0699eb209"
         )
+        for output in outputs:
+            for record in output["records"]:
+                if record["evidence_level"] == "E2":
+                    self.assertTrue(
+                        any(
+                            item["kind"] == "dex_string_reference"
+                            for item in record["evidence"]
+                        )
+                    )
 
-    def test_sdk_optimization_matches_original_rule_evidence(self):
+    def test_sdk_domain_precomputation_preserves_classified_evidence(self):
+        from scripts.static_analysis.rules import sdk_domain_matches
+
         types = [
-            "L" + prefixes[0] + "Example;"
+            "L" + prefixes[0] + ("" if prefixes[0].endswith(";") else "Example;")
             for _, _, prefixes, _ in SDK_RULES
             if prefixes
         ]
@@ -612,12 +623,27 @@ class PerformanceTests(unittest.TestCase):
         ]
         endpoints = endpoints * 5
         outputs = sdk_matches(types, endpoints, "fixture", "classes.dex")
-        digest = hashlib.sha256(
-            json.dumps(outputs, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
         self.assertEqual(
-            digest, "6b9b00c41bd578edf436544d683b51be7e0ec4cfc2fc89c03dcbaa52b7ea91d7"
+            outputs,
+            sdk_matches(
+                types,
+                endpoints,
+                "fixture",
+                "classes.dex",
+                sdk_domain_matches(endpoints),
+            ),
         )
+        self.assertEqual(
+            {item["name"] for item in outputs}, {name for name, _, _, _ in SDK_RULES}
+        )
+        self.assertEqual(len({item["id"] for item in outputs}), len(outputs))
+        domain_records = [
+            item for item in outputs if item["record_kind"] == "service_reference"
+        ]
+        self.assertEqual(
+            len(domain_records), sum(bool(domains) for _, _, _, domains in SDK_RULES)
+        )
+        self.assertTrue(all(len(item["evidence"]) == 1 for item in domain_records))
 
 
 if __name__ == "__main__":
